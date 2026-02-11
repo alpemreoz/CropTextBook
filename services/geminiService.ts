@@ -10,27 +10,37 @@ export const analyzeTestPage = async (base64Image: string, mimeType: string): Pr
   const prompt = `
     Analyze this image of a test paper or worksheet. 
     
-    Sometimes, multiple questions refer to a shared block of text, a passage, an image, or a graph (e.g., "37 ve 38. soruları aşağıdaki parçaya göre cevaplayınız." or "Answer questions 37 and 38 based on the passage").
+    CRITICAL REQUIREMENT: EXCLUDE QUESTION LABELS FROM CROPS
+    The user wants "clean" crops of the question content. 
+    The question numbers (e.g., "37.", "38.", "Q1") must be detected for metadata purposes, but they MUST NOT be inside the bounding box coordinates for the question body.
     
-    Task 1: Identify "Shared Contexts". Draw bounding boxes around these shared passages/images along with their instructional text. Give each an ID (e.g., "c1", "c2").
-    Task 2: Identify "Questions". A question block typically starts with a number (e.g., "37.", "Q1") and includes its text and options (A, B, C, D, E). 
-    - DO NOT include the shared context in the question's bounding box. The question box should strictly contain just that specific question.
-    - If a question relies on a shared context, include that context's ID in the 'contextId' field. If it does not, leave 'contextId' empty or omit it.
+    Task 1: Identify "Shared Contexts". 
+    - Draw bounding boxes around shared passages/images along with their instructional text (e.g. "37 ve 38. soruları..."). 
+    - Give each an ID (e.g., "c1", "c2").
 
-    IMPORTANT BOUNDING BOX RULES:
-    - Coordinates MUST be integers between 0 and 1000.
-    - They represent relative positions where [0,0] is the top-left corner of the image and [1000, 1000] is the bottom-right corner.
-    - ymin: Top edge of the box
-    - xmin: Left edge of the box
-    - ymax: Bottom edge of the box
-    - xmax: Right edge of the box
-    - Ensure ymax is strictly greater than ymin, and xmax is strictly greater than xmin.
-    - Make sure to leave a small margin around the text so nothing is cut off.
+    Task 2: Identify "Questions". 
+    - Extract the 'questionNumber' as a string (e.g., "37", "38").
+    - Find the bounding box ('box') for the question body.
+    - IMPORTANT: The 'box' MUST START AFTER the question number and its trailing punctuation (like '.' or ')').
+    - If the text is "37. Bu parçada...", the box xmin/ymin must start exactly at the "B" of "Bu".
+    - Do not include the question number, the dot, or the space immediately following the number in the bounding box.
+    - Ensure all options (A, B, C, D, E) and the full text are included.
+    - If a question relies on a shared context, include that context's 'contextId'.
+
+    OUTPUT JSON FORMAT:
+    {
+      "sharedContexts": [{"id": "c1", "ymin": 0, "xmin": 0, "ymax": 0, "xmax": 0}],
+      "questions": [{"questionNumber": "37", "ymin": 0, "xmin": 0, "ymax": 0, "xmax": 0, "contextId": "c1"}]
+    }
+
+    COORDINATE RULES:
+    - Values 0-1000 relative to image size.
+    - Be extremely precise. Even 1-2 units too far left might include the number. Err on the side of starting the box 2-3 units to the right of the actual number label.
   `;
 
   try {
     const response = await ai.models.generateContent({
-      model: "gemini-3-flash-preview", // Good balance of speed and vision capability
+      model: "gemini-3-flash-preview", 
       contents: [
         {
           inlineData: {
@@ -44,7 +54,7 @@ export const analyzeTestPage = async (base64Image: string, mimeType: string): Pr
         responseMimeType: "application/json",
         responseSchema: {
           type: Type.OBJECT,
-          description: "Structured test page data with shared contexts and questions.",
+          description: "Structured test page data with shared contexts and questions body strictly excluded from labels.",
           properties: {
             sharedContexts: {
               type: Type.ARRAY,
@@ -70,7 +80,7 @@ export const analyzeTestPage = async (base64Image: string, mimeType: string): Pr
                   xmin: { type: Type.INTEGER },
                   ymax: { type: Type.INTEGER },
                   xmax: { type: Type.INTEGER },
-                  contextId: { type: Type.STRING, description: "ID of the shared context block this question relies on. Leave empty if none." }
+                  contextId: { type: Type.STRING }
                 },
                 required: ["questionNumber", "ymin", "xmin", "ymax", "xmax"]
               }
@@ -89,7 +99,6 @@ export const analyzeTestPage = async (base64Image: string, mimeType: string): Pr
     const contexts = parsedData.sharedContexts || [];
     const questions = parsedData.questions || [];
 
-    // Create a lookup map for context bounding boxes
     const contextMap = new Map();
     contexts.forEach((c: any) => {
       if (c.id) {
@@ -99,14 +108,12 @@ export const analyzeTestPage = async (base64Image: string, mimeType: string): Pr
       }
     });
     
-    // Map the raw JSON response to our expected interface format
     return questions.map((q: any) => {
       const result: Omit<QuestionRegion, 'id' | 'croppedDataUrl'> = {
         questionNumber: q.questionNumber,
         box: { ymin: q.ymin, xmin: q.xmin, ymax: q.ymax, xmax: q.xmax }
       };
 
-      // If this question maps to a shared context, attach that bounding box
       if (q.contextId && contextMap.has(q.contextId)) {
         result.contextBox = contextMap.get(q.contextId);
       }
