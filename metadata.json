@@ -1,0 +1,5 @@
+{
+  "name": "Copy of Q-Crop",
+  "description": "An AI-powered tool to automatically detect, crop, and export individual questions from scanned exam pages or test papers.",
+  "requestFramePermissions": []
+}
