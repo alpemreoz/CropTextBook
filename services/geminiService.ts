@@ -16,35 +16,38 @@ export const analyzeTestPage = async (base64Image: string, mimeType: string): Pr
   const prompt = `
     Analyze this image of a test paper or worksheet. 
     
-    CRITICAL REQUIREMENTS:
-    1. Detect Page Metadata (Usually at the top/bottom):
-       - Page Number: Look for the number (e.g., "19") usually at the bottom center or corner.
-       - Test Number: Look for text like "TEST 01" or "Test 1" (often in a badge or at the top right).
-       - Topic/Unit: Look for headers like "2. Ünite" or "Şiirde Ahenk" at the top of the page. Extract both if available.
+    CRITICAL REQUIREMENTS FOR CLEAN CROPS:
+    1. Detect Page Metadata:
+       - Page Number: Extract (e.g., "19").
+       - Test Number: Extract (e.g., "01").
+       - Topic/Unit: Extract header info.
        
-    2. EXCLUDE QUESTION LABELS FROM CROPS:
-       - Detect question numbers (e.g., "1.", "2.", "3.") but ensure the bounding box 'box' EXCLUDES these labels. 
-       - The crop must be "clean", starting exactly where the question body text begins.
-
+    2. EXCLUSION RULES (IMPORTANT):
+       - EXCLUDE QUESTION LABELS: Do not include "1.", "2.", "37." etc. in the question bounding box.
+       - EXCLUDE MAPPING INSTRUCTIONS: Frequently, there is a line or bar that says something like "5, 6, 7. soruları aşağıdaki bilgilere göre çözünüz" (Questions 5, 6, 7 will be solved according to the information above). 
+         YOU MUST EXCLUDE THIS INSTRUCTIONAL LINE from both the 'sharedContexts' and the 'questions' bounding boxes. It should NOT be part of any crop.
+       
     Task 1: Identify "Shared Contexts". 
-    - Draw bounding boxes around shared passages/images along with their instructional text. 
+    - Draw bounding boxes around passages, images, or diagrams that apply to multiple questions.
+    - DO NOT include the instructional line (the mapping text mentioned above) in this box. Just the core content (text/images).
     - Give each an ID (e.g., "c1").
 
     Task 2: Identify "Questions". 
     - Extract the 'questionNumber' as a string.
-    - Find the bounding box ('box') for the question body strictly excluding the number label.
+    - Find the bounding box ('box') for the question body strictly.
+    - START the box at the first word of the question body, EXCLUDING the number label and any mapping instruction bars that might be above it.
     - If a question relies on a shared context, include its 'contextId'.
 
     OUTPUT JSON FORMAT:
     {
       "pageNumber": "19",
       "testNumber": "01",
-      "topic": "2. Ünite - Şiirde Ahenk",
+      "topic": "Geometri",
       "sharedContexts": [{"id": "c1", "ymin": 0, "xmin": 0, "ymax": 0, "xmax": 0}],
-      "questions": [{"questionNumber": "1", "ymin": 0, "xmin": 0, "ymax": 0, "xmax": 0, "contextId": "c1"}]
+      "questions": [{"questionNumber": "5", "ymin": 0, "xmin": 0, "ymax": 0, "xmax": 0, "contextId": "c1"}]
     }
 
-    COORDINATE RULES: 0-1000 relative to image size. Be extremely precise.
+    COORDINATE RULES: 0-1000 relative to image size. Precision is key to avoid "bleeding" of excluded elements into the crop.
   `;
 
   try {
@@ -65,11 +68,11 @@ export const analyzeTestPage = async (base64Image: string, mimeType: string): Pr
         responseMimeType: "application/json",
         responseSchema: {
           type: Type.OBJECT,
-          description: "Structured test page data with page metadata and clean crops.",
+          description: "Structured test page data with mapping instructions strictly excluded.",
           properties: {
             pageNumber: { type: Type.STRING },
-            testNumber: { type: Type.STRING, description: "Extracted test number, e.g. 01" },
-            topic: { type: Type.STRING, description: "Extracted unit or topic, e.g. 2. Unite - Siirde Ahenk" },
+            testNumber: { type: Type.STRING },
+            topic: { type: Type.STRING },
             sharedContexts: {
               type: Type.ARRAY,
               items: {
