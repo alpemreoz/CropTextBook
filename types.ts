@@ -8,10 +8,26 @@ export interface BoundingBox {
 export interface QuestionRegion {
   id: string;
   questionNumber: string;
+  pageNumber: string;
+  testNumber?: string; // e.g., "TEST 01"
+  topic?: string;      // e.g., "2. Ünite - Şiirde Ahenk"
   box: BoundingBox;
-  contextBox?: BoundingBox; // Stores the bounding box of a shared paragraph/image if applicable
+  contextBox?: BoundingBox;
   croppedDataUrl?: string;
   isSelected?: boolean;
+}
+
+export interface PageData {
+  id: string;
+  file: File;
+  dataUrl: string;
+  imageObj: HTMLImageElement | null;
+  status: AppStatus;
+  regions: QuestionRegion[];
+  pageNumber: string;
+  testNumber?: string;
+  topic?: string;
+  error?: string;
 }
 
 export type AppStatus = 'IDLE' | 'ANALYZING' | 'READY' | 'ERROR';

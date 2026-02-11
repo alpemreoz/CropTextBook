@@ -1,61 +1,75 @@
 import { GoogleGenAI, Type } from "@google/genai";
 import { QuestionRegion } from "../types";
 
-// Initialize AI inside functions to ensure latest API key if applicable
 const getAI = () => new GoogleGenAI({ apiKey: process.env.API_KEY });
 
-export const analyzeTestPage = async (base64Image: string, mimeType: string): Promise<Omit<QuestionRegion, 'id' | 'croppedDataUrl'>[]> => {
+export interface AnalysisResult {
+  pageNumber: string;
+  testNumber?: string;
+  topic?: string;
+  regions: Omit<QuestionRegion, 'id' | 'croppedDataUrl' | 'pageNumber' | 'testNumber' | 'topic'>[];
+}
+
+export const analyzeTestPage = async (base64Image: string, mimeType: string): Promise<AnalysisResult> => {
   const ai = getAI();
   
   const prompt = `
     Analyze this image of a test paper or worksheet. 
     
-    CRITICAL REQUIREMENT: EXCLUDE QUESTION LABELS FROM CROPS
-    The user wants "clean" crops of the question content. 
-    The question numbers (e.g., "37.", "38.", "Q1") must be detected for metadata purposes, but they MUST NOT be inside the bounding box coordinates for the question body.
-    
+    CRITICAL REQUIREMENTS:
+    1. Detect Page Metadata (Usually at the top/bottom):
+       - Page Number: Look for the number (e.g., "19") usually at the bottom center or corner.
+       - Test Number: Look for text like "TEST 01" or "Test 1" (often in a badge or at the top right).
+       - Topic/Unit: Look for headers like "2. Ünite" or "Şiirde Ahenk" at the top of the page. Extract both if available.
+       
+    2. EXCLUDE QUESTION LABELS FROM CROPS:
+       - Detect question numbers (e.g., "1.", "2.", "3.") but ensure the bounding box 'box' EXCLUDES these labels. 
+       - The crop must be "clean", starting exactly where the question body text begins.
+
     Task 1: Identify "Shared Contexts". 
-    - Draw bounding boxes around shared passages/images along with their instructional text (e.g. "37 ve 38. soruları..."). 
-    - Give each an ID (e.g., "c1", "c2").
+    - Draw bounding boxes around shared passages/images along with their instructional text. 
+    - Give each an ID (e.g., "c1").
 
     Task 2: Identify "Questions". 
-    - Extract the 'questionNumber' as a string (e.g., "37", "38").
-    - Find the bounding box ('box') for the question body.
-    - IMPORTANT: The 'box' MUST START AFTER the question number and its trailing punctuation (like '.' or ')').
-    - If the text is "37. Bu parçada...", the box xmin/ymin must start exactly at the "B" of "Bu".
-    - Do not include the question number, the dot, or the space immediately following the number in the bounding box.
-    - Ensure all options (A, B, C, D, E) and the full text are included.
-    - If a question relies on a shared context, include that context's 'contextId'.
+    - Extract the 'questionNumber' as a string.
+    - Find the bounding box ('box') for the question body strictly excluding the number label.
+    - If a question relies on a shared context, include its 'contextId'.
 
     OUTPUT JSON FORMAT:
     {
+      "pageNumber": "19",
+      "testNumber": "01",
+      "topic": "2. Ünite - Şiirde Ahenk",
       "sharedContexts": [{"id": "c1", "ymin": 0, "xmin": 0, "ymax": 0, "xmax": 0}],
-      "questions": [{"questionNumber": "37", "ymin": 0, "xmin": 0, "ymax": 0, "xmax": 0, "contextId": "c1"}]
+      "questions": [{"questionNumber": "1", "ymin": 0, "xmin": 0, "ymax": 0, "xmax": 0, "contextId": "c1"}]
     }
 
-    COORDINATE RULES:
-    - Values 0-1000 relative to image size.
-    - Be extremely precise. Even 1-2 units too far left might include the number. Err on the side of starting the box 2-3 units to the right of the actual number label.
+    COORDINATE RULES: 0-1000 relative to image size. Be extremely precise.
   `;
 
   try {
     const response = await ai.models.generateContent({
-      model: "gemini-3-flash-preview", 
-      contents: [
-        {
-          inlineData: {
-            data: base64Image,
-            mimeType: mimeType,
+      model: "gemini-3-pro-preview", 
+      contents: {
+        parts: [
+          {
+            inlineData: {
+              data: base64Image,
+              mimeType: mimeType,
+            },
           },
-        },
-        { text: prompt }
-      ],
+          { text: prompt }
+        ]
+      },
       config: {
         responseMimeType: "application/json",
         responseSchema: {
           type: Type.OBJECT,
-          description: "Structured test page data with shared contexts and questions body strictly excluded from labels.",
+          description: "Structured test page data with page metadata and clean crops.",
           properties: {
+            pageNumber: { type: Type.STRING },
+            testNumber: { type: Type.STRING, description: "Extracted test number, e.g. 01" },
+            topic: { type: Type.STRING, description: "Extracted unit or topic, e.g. 2. Unite - Siirde Ahenk" },
             sharedContexts: {
               type: Type.ARRAY,
               items: {
@@ -86,43 +100,45 @@ export const analyzeTestPage = async (base64Image: string, mimeType: string): Pr
               }
             }
           },
-          required: ["sharedContexts", "questions"]
+          required: ["pageNumber", "sharedContexts", "questions"]
         }
       }
     });
 
-    if (!response.text) {
-      throw new Error("Empty response from AI");
-    }
+    if (!response.text) throw new Error("Empty response from AI");
 
     const parsedData = JSON.parse(response.text);
     const contexts = parsedData.sharedContexts || [];
     const questions = parsedData.questions || [];
+    const pageNum = parsedData.pageNumber || "unknown";
+    const testNum = parsedData.testNumber;
+    const topic = parsedData.topic;
 
     const contextMap = new Map();
     contexts.forEach((c: any) => {
       if (c.id) {
-        contextMap.set(c.id, {
-          ymin: c.ymin, xmin: c.xmin, ymax: c.ymax, xmax: c.xmax
-        });
+        contextMap.set(c.id, { ymin: c.ymin, xmin: c.xmin, ymax: c.ymax, xmax: c.xmax });
       }
     });
     
-    return questions.map((q: any) => {
-      const result: Omit<QuestionRegion, 'id' | 'croppedDataUrl'> = {
-        questionNumber: q.questionNumber,
-        box: { ymin: q.ymin, xmin: q.xmin, ymax: q.ymax, xmax: q.xmax }
-      };
-
-      if (q.contextId && contextMap.has(q.contextId)) {
-        result.contextBox = contextMap.get(q.contextId);
-      }
-
-      return result;
-    });
+    return {
+      pageNumber: pageNum,
+      testNumber: testNum,
+      topic: topic,
+      regions: questions.map((q: any) => {
+        const result: any = {
+          questionNumber: q.questionNumber,
+          box: { ymin: q.ymin, xmin: q.xmin, ymax: q.ymax, xmax: q.xmax }
+        };
+        if (q.contextId && contextMap.has(q.contextId)) {
+          result.contextBox = contextMap.get(q.contextId);
+        }
+        return result;
+      })
+    };
 
   } catch (error) {
     console.error("Error analyzing test page:", error);
-    throw new Error("Failed to analyze the image. Please try again.");
+    throw new Error("Failed to analyze the page.");
   }
 };

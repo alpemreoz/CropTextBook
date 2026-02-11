@@ -1,102 +1,102 @@
-import React, { useState, useEffect, useRef, useCallback } from 'react';
+import React, { useState, useEffect, useRef, useCallback, useMemo } from 'react';
 import Uploader from './components/Uploader';
 import { analyzeTestPage } from './services/geminiService';
-import { QuestionRegion, AppStatus, BoundingBox } from './types';
-import { LoaderIcon, CheckIcon, DownloadIcon, ScissorsIcon } from './components/Icons';
+import { QuestionRegion, AppStatus, BoundingBox, PageData } from './types';
+import { LoaderIcon, DownloadIcon, ScissorsIcon } from './components/Icons';
 
 export default function App() {
-  const [status, setStatus] = useState<AppStatus>('IDLE');
-  const [errorMsg, setErrorMsg] = useState<string>('');
+  const [pages, setPages] = useState<PageData[]>([]);
+  const [activePageId, setActivePageId] = useState<string | null>(null);
+  const [isProcessing, setIsProcessing] = useState(false);
   
-  // Image data
-  const [imageFile, setImageFile] = useState<File | null>(null);
-  const [imageDataUrl, setImageDataUrl] = useState<string | null>(null);
-  const [imageObj, setImageObj] = useState<HTMLImageElement | null>(null);
-  
-  // App Data
-  const [regions, setRegions] = useState<QuestionRegion[]>([]);
-  
-  // Canvas Refs
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const containerRef = useRef<HTMLDivElement>(null);
 
-  // Helper to generate a unique ID
   const generateId = () => Math.random().toString(36).substr(2, 9);
 
-  // Handle new image upload
-  const handleImageSelected = useCallback(async (dataUrl: string, file: File) => {
-    setImageDataUrl(dataUrl);
-    setImageFile(file);
-    setStatus('ANALYZING');
-    setErrorMsg('');
-    setRegions([]);
+  const activePage = useMemo(() => 
+    pages.find(p => p.id === activePageId), [pages, activePageId]
+  );
 
-    // Load image object for cropping later
-    const img = new Image();
-    img.onload = async () => {
-      setImageObj(img);
-      
+  const handleImagesSelected = useCallback(async (newFiles: { dataUrl: string, file: File }[]) => {
+    const newPages: PageData[] = newFiles.map(f => ({
+      id: generateId(),
+      file: f.file,
+      dataUrl: f.dataUrl,
+      imageObj: null,
+      status: 'IDLE',
+      regions: [],
+      pageNumber: '...',
+    }));
+
+    setPages(prev => [...prev, ...newPages]);
+    if (!activePageId) setActivePageId(newPages[0].id);
+    setIsProcessing(true);
+  }, [activePageId]);
+
+  // Serial processing effect for pages
+  useEffect(() => {
+    const processNext = async () => {
+      const pendingPage = pages.find(p => p.status === 'IDLE');
+      if (!pendingPage) {
+        setIsProcessing(false);
+        return;
+      }
+
+      setPages(prev => prev.map(p => p.id === pendingPage.id ? { ...p, status: 'ANALYZING' } : p));
+
       try {
-        // Prepare base64 for API (remove data URI prefix)
-        const base64String = dataUrl.split(',')[1];
-        
-        // Call Gemini API
-        const detectedRegions = await analyzeTestPage(base64String, file.type);
-        
-        // Add IDs to regions
-        const regionsWithIds: QuestionRegion[] = detectedRegions.map(r => ({
+        const img = new Image();
+        img.src = pendingPage.dataUrl;
+        await new Promise((resolve, reject) => {
+          img.onload = resolve;
+          img.onerror = reject;
+        });
+
+        const base64 = pendingPage.dataUrl.split(',')[1];
+        const result = await analyzeTestPage(base64, pendingPage.file.type);
+
+        const regionsWithData: QuestionRegion[] = result.regions.map(r => ({
           ...r,
-          id: generateId()
+          id: generateId(),
+          pageNumber: result.pageNumber,
+          testNumber: result.testNumber,
+          topic: result.topic,
+          croppedDataUrl: cropImage(img, r.box, (r as any).contextBox)
         }));
 
-        setRegions(regionsWithIds);
-        setStatus('READY');
+        setPages(prev => prev.map(p => p.id === pendingPage.id ? { 
+          ...p, 
+          status: 'READY', 
+          imageObj: img,
+          pageNumber: result.pageNumber,
+          testNumber: result.testNumber,
+          topic: result.topic,
+          regions: regionsWithData 
+        } : p));
       } catch (err: any) {
-        setStatus('ERROR');
-        setErrorMsg(err.message || "An error occurred during analysis.");
+        setPages(prev => prev.map(p => p.id === pendingPage.id ? { 
+          ...p, 
+          status: 'ERROR', 
+          error: err.message 
+        } : p));
       }
     };
-    img.onerror = () => {
-      setStatus('ERROR');
-      setErrorMsg("Failed to load the image locally.");
-    };
-    img.src = dataUrl;
-  }, []);
 
-  // Process crops when regions or imageObj changes
+    if (isProcessing) processNext();
+  }, [pages, isProcessing]);
+
+  // Canvas Drawing Logic
   useEffect(() => {
-    if (status === 'READY' && imageObj && regions.length > 0 && !regions[0].croppedDataUrl) {
-      const generateCrops = async () => {
-        const updatedRegions = [...regions];
-        for (let i = 0; i < updatedRegions.length; i++) {
-          const region = updatedRegions[i];
-          if (!region.croppedDataUrl) {
-             updatedRegions[i] = {
-                 ...region,
-                 croppedDataUrl: cropImage(imageObj, region.box, region.contextBox)
-             };
-          }
-        }
-        setRegions(updatedRegions);
-      };
-      generateCrops();
-    }
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [status, imageObj, regions]);
-
-
-  // Draw main canvas
-  useEffect(() => {
-    if (status !== 'READY' && status !== 'ANALYZING') return;
-    if (!imageObj || !canvasRef.current || !containerRef.current) return;
+    if (!activePage || !activePage.imageObj || !canvasRef.current || !containerRef.current) return;
 
     const canvas = canvasRef.current;
     const ctx = canvas.getContext('2d');
     if (!ctx) return;
 
     const container = containerRef.current;
-    
-    // Fit canvas to container while maintaining aspect ratio
+    const { imageObj, regions, status } = activePage;
+
     const containerRatio = container.clientWidth / container.clientHeight;
     const imageRatio = imageObj.width / imageObj.height;
 
@@ -111,346 +111,282 @@ export default function App() {
 
     canvas.width = drawWidth;
     canvas.height = drawHeight;
-
-    // Draw image
     ctx.drawImage(imageObj, 0, 0, drawWidth, drawHeight);
 
-    // Draw overlays if READY
     if (status === 'READY') {
-      // 1. Draw Context Boxes first
+      // Draw Contexts
       const drawnContexts = new Set<string>();
       regions.forEach(region => {
         if (region.contextBox) {
           const c = region.contextBox;
           const key = `${c.xmin},${c.ymin},${c.xmax},${c.ymax}`;
-          
           if (!drawnContexts.has(key)) {
             drawnContexts.add(key);
-            
-            const startX = (c.xmin / 1000) * drawWidth;
-            const startY = (c.ymin / 1000) * drawHeight;
-            const width = ((c.xmax - c.xmin) / 1000) * drawWidth;
-            const height = ((c.ymax - c.ymin) / 1000) * drawHeight;
-
             ctx.beginPath();
-            ctx.rect(startX, startY, width, height);
+            ctx.rect((c.xmin / 1000) * drawWidth, (c.ymin / 1000) * drawHeight, ((c.xmax - c.xmin) / 1000) * drawWidth, ((c.ymax - c.ymin) / 1000) * drawHeight);
             ctx.fillStyle = 'rgba(168, 85, 247, 0.05)'; 
             ctx.fill();
-            ctx.lineWidth = 1;
-            ctx.setLineDash([4, 4]);
-            ctx.strokeStyle = 'rgba(168, 85, 247, 0.4)';
-            ctx.stroke();
-            ctx.setLineDash([]); 
+            ctx.lineWidth = 1; ctx.setLineDash([4, 4]); ctx.strokeStyle = 'rgba(168, 85, 247, 0.4)'; ctx.stroke(); ctx.setLineDash([]); 
           }
         }
       });
 
-      // 2. Draw Question Boxes
+      // Draw Questions
       regions.forEach(region => {
         const { ymin, xmin, ymax, xmax } = region.box;
-        
         const startX = (xmin / 1000) * drawWidth;
         const startY = (ymin / 1000) * drawHeight;
         const width = ((xmax - xmin) / 1000) * drawWidth;
         const height = ((ymax - ymin) / 1000) * drawHeight;
 
-        ctx.beginPath();
-        ctx.rect(startX, startY, width, height);
-        
+        ctx.beginPath(); ctx.rect(startX, startY, width, height);
         if (region.isSelected) {
-          ctx.fillStyle = 'rgba(34, 197, 94, 0.2)';
-          ctx.fill();
-          ctx.lineWidth = 2;
-          ctx.strokeStyle = '#16a34a';
+          ctx.fillStyle = 'rgba(34, 197, 94, 0.2)'; ctx.lineWidth = 2; ctx.strokeStyle = '#16a34a';
         } else {
-           ctx.fillStyle = 'rgba(59, 130, 246, 0.1)';
-           ctx.fill();
-           ctx.lineWidth = 1.5;
-           ctx.strokeStyle = 'rgba(59, 130, 246, 0.6)';
+           ctx.fillStyle = 'rgba(59, 130, 246, 0.1)'; ctx.lineWidth = 1.5; ctx.strokeStyle = 'rgba(59, 130, 246, 0.6)';
         }
-        ctx.stroke();
+        ctx.fill(); ctx.stroke();
 
         ctx.fillStyle = region.isSelected ? '#16a34a' : 'rgba(59, 130, 246, 0.8)';
         ctx.font = 'bold 12px sans-serif';
         const text = `Q${region.questionNumber}`;
         const textMetrics = ctx.measureText(text);
-        const textWidth = textMetrics.width;
-        
-        ctx.fillRect(startX, startY - 20 > 0 ? startY - 20 : startY, textWidth + 12, 20);
-        ctx.fillStyle = 'white';
-        ctx.fillText(text, startX + 6, (startY - 20 > 0 ? startY - 6 : startY + 14));
+        ctx.fillRect(startX, startY - 20 > 0 ? startY - 20 : startY, textMetrics.width + 12, 20);
+        ctx.fillStyle = 'white'; ctx.fillText(text, startX + 6, (startY - 20 > 0 ? startY - 6 : startY + 14));
       });
     }
-
-  }, [imageObj, regions, status, containerRef.current?.clientWidth, containerRef.current?.clientHeight]); 
-
-  useEffect(() => {
-    const handleResize = () => setRegions(prev => [...prev]);
-    window.addEventListener('resize', handleResize);
-    return () => window.removeEventListener('resize', handleResize);
-  }, []);
+  }, [activePage, containerRef.current?.clientWidth, containerRef.current?.clientHeight]);
 
   const cropImage = (img: HTMLImageElement, qBox: BoundingBox, cBox?: BoundingBox): string => {
-    const offscreenCanvas = document.createElement('canvas');
-    const ctx = offscreenCanvas.getContext('2d');
+    const canvas = document.createElement('canvas');
+    const ctx = canvas.getContext('2d');
     if (!ctx) return '';
 
-    // Very minimal padding to avoid including nearby labels
-    const paddingX = img.width * 0.005; 
-    const paddingY = img.height * 0.005;
-
-    const getCoords = (box: BoundingBox, isQuestion: boolean) => {
-      // For questions, we use even less left-padding because the label is usually on the left
-      const leftPad = isQuestion ? img.width * 0.002 : paddingX; 
-      
-      const sx = Math.max(0, (box.xmin / 1000) * img.width - leftPad);
-      const sy = Math.max(0, (box.ymin / 1000) * img.height - paddingY);
-      const sw = Math.min(img.width - sx, ((box.xmax - box.xmin) / 1000) * img.width + (leftPad + paddingX));
-      const sh = Math.min(img.height - sy, ((box.ymax - box.ymin) / 1000) * img.height + paddingY * 2);
+    const pX = img.width * 0.005, pY = img.height * 0.005;
+    const getC = (box: BoundingBox, isQ: boolean) => {
+      const lP = isQ ? img.width * 0.002 : pX; 
+      const sx = Math.max(0, (box.xmin / 1000) * img.width - lP);
+      const sy = Math.max(0, (box.ymin / 1000) * img.height - pY);
+      const sw = Math.min(img.width - sx, ((box.xmax - box.xmin) / 1000) * img.width + (lP + pX));
+      const sh = Math.min(img.height - sy, ((box.ymax - box.ymin) / 1000) * img.height + pY * 2);
       return { sx, sy, sw, sh };
     };
 
-    const q = getCoords(qBox, true);
-
+    const q = getC(qBox, true);
     if (!cBox) {
-      offscreenCanvas.width = q.sw;
-      offscreenCanvas.height = q.sh;
-      ctx.fillStyle = '#ffffff';
-      ctx.fillRect(0, 0, q.sw, q.sh);
+      canvas.width = q.sw; canvas.height = q.sh; ctx.fillStyle = '#fff'; ctx.fillRect(0,0,q.sw,q.sh);
       ctx.drawImage(img, q.sx, q.sy, q.sw, q.sh, 0, 0, q.sw, q.sh);
     } else {
-      const c = getCoords(cBox, false);
-      const gap = 40; 
-      
-      offscreenCanvas.width = Math.max(c.sw, q.sw);
-      offscreenCanvas.height = c.sh + gap + q.sh;
-
-      ctx.fillStyle = '#ffffff';
-      ctx.fillRect(0, 0, offscreenCanvas.width, offscreenCanvas.height);
-
-      // Center horizontally if widths differ
-      const cOffsetX = (offscreenCanvas.width - c.sw) / 2;
-      const qOffsetX = (offscreenCanvas.width - q.sw) / 2;
-
-      ctx.drawImage(img, c.sx, c.sy, c.sw, c.sh, cOffsetX, 0, c.sw, c.sh);
-
-      ctx.beginPath();
-      ctx.setLineDash([10, 10]);
-      ctx.moveTo(30, c.sh + gap / 2);
-      ctx.lineTo(offscreenCanvas.width - 30, c.sh + gap / 2);
-      ctx.strokeStyle = '#e2e8f0'; 
-      ctx.lineWidth = 2;
-      ctx.stroke();
-      ctx.setLineDash([]); 
-
-      ctx.drawImage(img, q.sx, q.sy, q.sw, q.sh, qOffsetX, c.sh + gap, q.sw, q.sh);
+      const c = getC(cBox, false); const gap = 40;
+      canvas.width = Math.max(c.sw, q.sw); canvas.height = c.sh + gap + q.sh;
+      ctx.fillStyle = '#fff'; ctx.fillRect(0,0,canvas.width,canvas.height);
+      ctx.drawImage(img, c.sx, c.sy, c.sw, c.sh, (canvas.width-c.sw)/2, 0, c.sw, c.sh);
+      ctx.beginPath(); ctx.setLineDash([10,10]); ctx.moveTo(30, c.sh+gap/2); ctx.lineTo(canvas.width-30, c.sh+gap/2);
+      ctx.strokeStyle = '#e2e8f0'; ctx.lineWidth = 2; ctx.stroke(); ctx.setLineDash([]);
+      ctx.drawImage(img, q.sx, q.sy, q.sw, q.sh, (canvas.width-q.sw)/2, c.sh+gap, q.sw, q.sh);
     }
+    return canvas.toDataURL('image/jpeg', 0.92);
+  };
 
-    return offscreenCanvas.toDataURL('image/jpeg', 0.92);
+  const sanitizeFilename = (str: string) => {
+    return str.replace(/[^a-z0-9]/gi, '_').replace(/_+/g, '_').toLowerCase();
   };
 
   const handleDownloadCrop = (region: QuestionRegion) => {
     if (!region.croppedDataUrl) return;
     const link = document.createElement('a');
     link.href = region.croppedDataUrl;
-    link.download = `Q${region.questionNumber}_Clean.jpg`;
-    document.body.appendChild(link);
-    link.click();
-    document.body.removeChild(link);
+    
+    // Complex filename convention
+    const testPart = region.testNumber ? `Test${sanitizeFilename(region.testNumber)}_` : '';
+    const topicPart = region.topic ? `${sanitizeFilename(region.topic)}_` : '';
+    const name = `${testPart}${topicPart}Q${region.questionNumber}_${region.pageNumber}.jpg`;
+    
+    link.download = name;
+    document.body.appendChild(link); link.click(); document.body.removeChild(link);
   };
 
   const handleDownloadAll = () => {
-    regions.forEach((region, idx) => {
-      if (region.croppedDataUrl) {
-         setTimeout(() => handleDownloadCrop(region), idx * 200);
-      }
+    let count = 0;
+    pages.forEach(page => {
+      page.regions.forEach(region => {
+        if (region.croppedDataUrl) {
+          setTimeout(() => handleDownloadCrop(region), count * 200);
+          count++;
+        }
+      });
     });
   };
 
-  const handleSelectRegion = (id: string) => {
-    setRegions(prev => prev.map(r => ({
-      ...r,
-      isSelected: r.id === id
-    })));
+  const handleSelectRegion = (id: string, pId: string) => {
+    setPages(prev => prev.map(p => {
+      if (p.id !== pId) return p;
+      return { ...p, regions: p.regions.map(r => ({ ...r, isSelected: r.id === id })) };
+    }));
   };
 
-  const handleReset = () => {
-    setStatus('IDLE');
-    setImageFile(null);
-    setImageDataUrl(null);
-    setImageObj(null);
-    setRegions([]);
-  };
+  const allQuestions = useMemo(() => pages.flatMap(p => p.regions), [pages]);
 
   return (
     <>
-      <header className="bg-white border-b border-gray-200 px-6 py-4 flex items-center justify-between shrink-0 sticky top-0 z-50">
-        <div className="flex items-center gap-3">
-          <div className="bg-brand-600 text-white p-2 rounded-xl shadow-sm">
-            <ScissorsIcon className="w-5 h-5" />
+      <header className="bg-white border-b border-slate-200 px-6 py-4 flex items-center justify-between shrink-0 sticky top-0 z-50">
+        <div className="flex items-center gap-4">
+          <div className="bg-brand-600 text-white p-2.5 rounded-2xl shadow-lg shadow-brand-100">
+            <ScissorsIcon className="w-6 h-6" />
           </div>
           <div>
-            <h1 className="text-xl font-bold text-slate-900 tracking-tight leading-none mb-1">Q-Crop</h1>
-            <p className="text-[10px] uppercase tracking-widest text-slate-400 font-bold">Clean Extraction Pro</p>
+            <h1 className="text-2xl font-black text-slate-900 tracking-tighter leading-none mb-1">Q-Crop</h1>
+            <p className="text-[10px] uppercase tracking-[0.2em] text-slate-400 font-black">Intelligent Extraction Pro</p>
           </div>
         </div>
         
-        {status !== 'IDLE' && (
-          <button 
-            onClick={handleReset}
-            className="px-4 py-2 text-sm font-semibold text-slate-500 hover:text-slate-800 bg-slate-100 hover:bg-slate-200 rounded-lg transition-all"
-          >
-            Start Over
+        {pages.length > 0 && (
+          <button onClick={() => {setPages([]); setActivePageId(null);}} className="px-5 py-2.5 text-sm font-black text-slate-600 hover:text-red-600 bg-slate-100 hover:bg-red-50 rounded-xl transition-all uppercase tracking-widest">
+            Reset App
           </button>
         )}
       </header>
 
       <main className="flex-1 flex overflow-hidden">
-        {status === 'IDLE' && (
-           <Uploader onImageSelected={handleImageSelected} isLoading={false} />
-        )}
-
-        {(status === 'ANALYZING' || status === 'ERROR') && !regions.length && (
-           <div className="flex-1 flex flex-col items-center justify-center p-8 text-center bg-gray-50">
-              {status === 'ANALYZING' && (
-                 <div className="bg-white p-12 rounded-3xl shadow-xl border border-slate-100 max-w-sm flex flex-col items-center">
-                   <div className="relative mb-8">
-                     <div className="absolute inset-0 bg-brand-200 rounded-full blur-2xl opacity-50 animate-pulse"></div>
-                     <LoaderIcon className="w-16 h-16 text-brand-500 relative" />
-                   </div>
-                   <h2 className="text-2xl font-bold text-slate-800 mb-3">Cleaning Crops...</h2>
-                   <p className="text-slate-500 text-sm leading-relaxed">Our AI is meticulously excluding labels and stitching context for a perfect export.</p>
-                 </div>
-              )}
-              {status === 'ERROR' && (
-                 <div className="bg-white p-12 rounded-3xl shadow-xl border border-red-100 max-w-sm flex flex-col items-center">
-                   <div className="w-16 h-16 bg-red-50 text-red-500 rounded-full flex items-center justify-center mb-6">
-                      <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" strokeWidth={2} stroke="currentColor" className="w-8 h-8">
-                        <path strokeLinecap="round" strokeLinejoin="round" d="M12 9v3.75m9-.75a9 9 0 11-18 0 9 9 0 0118 0zm-9 3.75h.008v.008H12v-.008z" />
-                      </svg>
-                   </div>
-                   <h2 className="text-xl font-bold text-slate-800 mb-2">Analysis Failed</h2>
-                   <p className="text-red-500 text-sm mb-8">{errorMsg}</p>
-                   <button 
-                     onClick={handleReset}
-                     className="w-full py-3 bg-slate-900 text-white rounded-xl hover:bg-slate-800 font-bold transition-all shadow-lg shadow-slate-200"
-                   >
-                     Try Another Image
-                   </button>
-                 </div>
-              )}
-           </div>
-        )}
-
-        {(status === 'READY' || (status === 'ANALYZING' && imageDataUrl)) && (
+        {pages.length === 0 ? (
+           <Uploader onImagesSelected={handleImagesSelected} isLoading={false} />
+        ) : (
           <div className="flex-1 flex w-full h-full">
             
-            <div className="flex-1 bg-slate-100 p-6 overflow-hidden relative" ref={containerRef}>
-                <div className="w-full h-full flex items-center justify-center relative shadow-2xl bg-slate-300/50 rounded-2xl overflow-hidden border border-slate-200/50">
-                    <canvas 
-                      ref={canvasRef} 
-                      className="block max-w-full max-h-full shadow-2xl bg-white rounded-sm"
-                      style={{ objectFit: 'contain' }}
-                    />
+            {/* Page Navigation Strip */}
+            <div className="w-24 bg-slate-900 border-r border-slate-800 flex flex-col shrink-0 overflow-y-auto items-center py-4 gap-4 no-scrollbar">
+              {pages.map((p, idx) => (
+                <button 
+                  key={p.id}
+                  onClick={() => setActivePageId(p.id)}
+                  className={`w-14 h-14 rounded-2xl overflow-hidden border-4 transition-all relative flex-shrink-0
+                    ${activePageId === p.id ? 'border-brand-500 scale-110 shadow-lg shadow-brand-500/20' : 'border-slate-700 hover:border-slate-500 opacity-60'}
+                  `}
+                >
+                  <img src={p.dataUrl} className="w-full h-full object-cover" />
+                  <div className="absolute inset-0 flex items-center justify-center bg-black/40 text-white text-[10px] font-black uppercase">
+                    {p.status === 'ANALYZING' ? <LoaderIcon className="w-4 h-4" /> : `P${p.pageNumber}`}
+                  </div>
+                </button>
+              ))}
+            </div>
+
+            <div className="flex-1 bg-slate-100 p-6 overflow-hidden relative flex flex-col" ref={containerRef}>
+                <div className="flex-1 flex items-center justify-center relative shadow-2xl bg-slate-300/30 rounded-3xl overflow-hidden border border-slate-200/50">
+                    {activePage?.imageObj ? (
+                      <canvas ref={canvasRef} className="block max-w-full max-h-full shadow-2xl bg-white" />
+                    ) : (
+                      <div className="flex flex-col items-center gap-4">
+                        <LoaderIcon className="w-12 h-12 text-brand-500" />
+                        <span className="text-slate-500 font-bold">Preparing Page {activePage?.pageNumber}...</span>
+                      </div>
+                    )}
                     
-                    {status === 'ANALYZING' && (
-                      <div className="absolute inset-0 bg-white/40 backdrop-blur-[2px] flex items-center justify-center z-10">
-                         <div className="bg-white px-6 py-4 rounded-2xl shadow-xl flex items-center gap-3">
-                           <LoaderIcon className="w-5 h-5 text-brand-600" />
-                           <span className="font-bold text-slate-700 text-sm">Updating Analysis...</span>
+                    {activePage?.status === 'ANALYZING' && (
+                      <div className="absolute inset-0 bg-white/40 backdrop-blur-sm flex items-center justify-center z-10">
+                         <div className="bg-white px-8 py-5 rounded-3xl shadow-2xl flex items-center gap-4">
+                           <LoaderIcon className="w-6 h-6 text-brand-600" />
+                           <span className="font-black text-slate-800 text-sm uppercase tracking-widest">AI Scanning Page {activePage.pageNumber}</span>
                          </div>
                       </div>
                     )}
                 </div>
+                
+                <div className="h-14 flex flex-col items-center justify-center">
+                   <div className="flex items-center gap-4 text-slate-400 font-black text-[10px] uppercase tracking-[0.2em]">
+                      <span>Page {activePage?.pageNumber || '...'}</span>
+                      {activePage?.testNumber && (
+                        <>
+                          <span className="w-1 h-1 bg-slate-300 rounded-full"></span>
+                          <span className="text-brand-600">Test {activePage.testNumber}</span>
+                        </>
+                      )}
+                      {activePage?.topic && (
+                        <>
+                          <span className="w-1 h-1 bg-slate-300 rounded-full"></span>
+                          <span className="text-slate-500">{activePage.topic}</span>
+                        </>
+                      )}
+                   </div>
+                </div>
             </div>
 
             <div className="w-[400px] bg-white border-l border-slate-200 flex flex-col shrink-0 z-20 overflow-hidden">
-              
-              <div className="p-6 border-b border-slate-100 bg-slate-50/30 shrink-0">
-                <div className="flex justify-between items-end mb-4">
+              <div className="p-8 border-b border-slate-100 bg-slate-50/20 shrink-0">
+                <div className="flex justify-between items-end mb-6">
                   <div>
-                    <h2 className="text-lg font-bold text-slate-900">Output Preview</h2>
-                    <p className="text-xs text-slate-500">Labels are removed from final images.</p>
+                    <h2 className="text-xl font-black text-slate-900 tracking-tighter">Export Queue</h2>
+                    <p className="text-xs text-slate-400 font-bold uppercase tracking-widest mt-1">Files named by Test & Topic</p>
                   </div>
-                  <span className="bg-slate-900 text-white text-[10px] font-black px-2.5 py-1 rounded-md uppercase">
-                    {regions.length} Items
+                  <span className="bg-slate-900 text-white text-[10px] font-black px-3 py-1.5 rounded-lg">
+                    {allQuestions.length} TOTAL
                   </span>
                 </div>
                 
                 <button
                   onClick={handleDownloadAll}
-                  disabled={regions.length === 0 || !regions.every(r => r.croppedDataUrl)}
-                  className="w-full bg-brand-600 hover:bg-brand-700 text-white font-bold py-3.5 px-4 rounded-xl flex items-center justify-center gap-2.5 transition-all disabled:opacity-30 disabled:grayscale shadow-lg shadow-brand-100 active:scale-[0.98]"
+                  disabled={allQuestions.length === 0}
+                  className="w-full bg-brand-600 hover:bg-brand-700 text-white font-black py-4 px-4 rounded-2xl flex items-center justify-center gap-3 transition-all disabled:opacity-20 shadow-xl shadow-brand-100 active:scale-[0.97] uppercase text-sm tracking-widest"
                 >
                   <DownloadIcon className="w-5 h-5" />
-                  Download All Clean Crops
+                  Export All (Auto-Named)
                 </button>
               </div>
 
-              <div className="flex-1 overflow-y-auto p-6 space-y-6">
-                {regions.map((region) => (
-                  <div 
-                    key={region.id} 
-                    className={`group relative border-2 rounded-2xl overflow-hidden transition-all duration-300
-                      ${region.isSelected ? 'border-brand-500 shadow-xl shadow-brand-50/50 scale-[1.02]' : 'border-slate-100 hover:border-slate-200'}
-                    `}
-                    onClick={() => handleSelectRegion(region.id)}
-                  >
-                    <div className={`px-4 py-2.5 flex justify-between items-center transition-colors ${region.isSelected ? 'bg-brand-50' : 'bg-slate-50'}`}>
-                      <div className="flex items-center gap-2">
-                        <span className={`text-[10px] font-black uppercase px-1.5 py-0.5 rounded ${region.isSelected ? 'bg-brand-600 text-white' : 'bg-slate-200 text-slate-600'}`}>
-                          Q{region.questionNumber}
-                        </span>
-                        {region.contextBox && (
-                          <span className="bg-purple-100 text-purple-700 text-[10px] font-black uppercase px-1.5 py-0.5 rounded">
-                            + Context
-                          </span>
-                        )}
+              <div className="flex-1 overflow-y-auto p-6 space-y-8 no-scrollbar">
+                {pages.map(page => (
+                  <div key={page.id} className="space-y-4">
+                    <div className="sticky top-0 z-10 bg-white/90 backdrop-blur py-2 flex flex-col border-b border-slate-100">
+                      <div className="flex items-center gap-3">
+                        <div className="w-6 h-6 bg-slate-800 text-white rounded-lg flex items-center justify-center text-[10px] font-black">
+                          {page.pageNumber}
+                        </div>
+                        <span className="text-xs font-black text-slate-800 uppercase tracking-widest">Page {page.pageNumber}</span>
                       </div>
-                      <button
-                        onClick={(e) => { e.stopPropagation(); handleDownloadCrop(region); }}
-                        disabled={!region.croppedDataUrl}
-                        className="text-slate-400 hover:text-brand-600 p-1.5 rounded-lg hover:bg-white transition-all disabled:opacity-0"
-                      >
-                         <DownloadIcon className="w-4 h-4" />
-                      </button>
-                    </div>
-                    
-                    <div className="bg-white p-4 cursor-pointer">
-                      {region.croppedDataUrl ? (
-                         <div className="relative">
-                           <img 
-                              src={region.croppedDataUrl} 
-                              alt={`Crop for question ${region.questionNumber}`}
-                              className="w-full h-auto max-h-64 object-contain rounded-lg border border-slate-50 bg-slate-50/20"
-                           />
-                           <div className="absolute top-2 right-2 flex gap-1 opacity-0 group-hover:opacity-100 transition-opacity">
-                              <div className="bg-white/90 backdrop-blur shadow-sm border border-slate-100 px-2 py-1 rounded text-[9px] font-bold text-slate-500 uppercase">
-                                Clean Crop
-                              </div>
-                           </div>
-                         </div>
-                      ) : (
-                         <div className="w-full h-32 flex flex-col items-center justify-center bg-slate-50 rounded-lg animate-pulse">
-                           <div className="w-8 h-8 rounded-full bg-slate-200 mb-2"></div>
-                           <span className="text-[10px] text-slate-400 font-bold uppercase tracking-wider">Rendering...</span>
-                         </div>
+                      {page.topic && (
+                        <span className="text-[10px] text-slate-400 font-bold truncate mt-1 pl-9">
+                          {page.topic}
+                        </span>
                       )}
                     </div>
+
+                    {page.regions.map((region) => (
+                      <div 
+                        key={region.id} 
+                        className={`group relative border-2 rounded-2xl overflow-hidden transition-all duration-300
+                          ${region.isSelected ? 'border-brand-500 shadow-xl shadow-brand-50/50 scale-[1.02]' : 'border-slate-100 hover:border-slate-300'}
+                        `}
+                        onClick={() => { setActivePageId(page.id); handleSelectRegion(region.id, page.id); }}
+                      >
+                        <div className={`px-4 py-3 flex justify-between items-center transition-colors ${region.isSelected ? 'bg-brand-50' : 'bg-slate-50'}`}>
+                          <div className="flex flex-col">
+                            <span className={`text-[11px] font-black px-2 py-0.5 rounded-lg w-fit ${region.isSelected ? 'bg-brand-600 text-white' : 'bg-slate-800 text-white'}`}>
+                              Q{region.questionNumber}
+                            </span>
+                            <span className="text-[9px] text-slate-400 font-bold mt-1">
+                              {region.testNumber ? `Test ${region.testNumber}` : ''}
+                            </span>
+                          </div>
+                          <button
+                            onClick={(e) => { e.stopPropagation(); handleDownloadCrop(region); }}
+                            className="text-slate-400 hover:text-brand-600 p-2 rounded-xl hover:bg-white transition-all"
+                          >
+                             <DownloadIcon className="w-5 h-5" />
+                          </button>
+                        </div>
+                        
+                        <div className="bg-white p-4">
+                          {region.croppedDataUrl ? (
+                             <img src={region.croppedDataUrl} className="w-full h-auto max-h-64 object-contain rounded-xl border border-slate-50" />
+                          ) : (
+                             <div className="w-full h-24 flex items-center justify-center bg-slate-50 rounded-xl animate-pulse text-[10px] font-bold text-slate-300 uppercase tracking-widest">Cleaning...</div>
+                          )}
+                        </div>
+                      </div>
+                    ))}
                   </div>
                 ))}
-                
-                {regions.length === 0 && status === 'READY' && (
-                   <div className="text-center py-20 flex flex-col items-center">
-                     <div className="w-16 h-16 bg-slate-50 rounded-full flex items-center justify-center mb-4">
-                       <ScissorsIcon className="w-8 h-8 text-slate-300" />
-                     </div>
-                     <p className="font-bold text-slate-400 text-sm">No Questions Found</p>
-                     <p className="text-slate-300 text-xs mt-1">Try a clearer image.</p>
-                   </div>
-                )}
               </div>
-
             </div>
           </div>
         )}
