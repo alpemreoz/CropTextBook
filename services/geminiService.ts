@@ -23,9 +23,12 @@ export const analyzeTestPage = async (base64Image: string, mimeType: string): Pr
        - Topic/Unit: Extract header info.
        
     2. EXCLUSION RULES (IMPORTANT):
-       - EXCLUDE QUESTION LABELS: Do not include "1.", "2.", "37." etc. in the question bounding box.
+       - EXCLUDE QUESTION LABELS: Do not include "1.", "2.", "37." etc. in the question bounding box. The bounding box MUST start horizontally (xmin) AFTER the question number label.
        - EXCLUDE MAPPING INSTRUCTIONS: Frequently, there is a line or bar that says something like "5, 6, 7. soruları aşağıdaki bilgilere göre çözünüz" (Questions 5, 6, 7 will be solved according to the information above). 
          YOU MUST EXCLUDE THIS INSTRUCTIONAL LINE from both the 'sharedContexts' and the 'questions' bounding boxes. It should NOT be part of any crop.
+       - EXCLUDE COLUMN SEPARATORS: If the page has two columns, do not include the vertical line separating them in any bounding box. Keep a safe margin (at least 5-10 units) away from the center line.
+       - EXCLUDE PAGE BORDERS: Do not include any black borders, edges of the paper, or scanner artifacts.
+       - EXCLUDE HEADERS/FOOTERS: Do not include page numbers, test titles, or any other header/footer elements in the question boxes.
        
     Task 1: Identify "Shared Contexts". 
     - Draw bounding boxes around passages, images, or diagrams that apply to multiple questions.
@@ -35,7 +38,8 @@ export const analyzeTestPage = async (base64Image: string, mimeType: string): Pr
     Task 2: Identify "Questions". 
     - Extract the 'questionNumber' as a string.
     - Find the bounding box ('box') for the question body strictly.
-    - START the box at the first word of the question body, EXCLUDING the number label and any mapping instruction bars that might be above it.
+    - START the box at the first word of the question body.
+    - CRITICAL: The 'xmin' of the question box MUST be to the right of the question number label (e.g., "1.", "2."). Do not capture the number itself.
     - If a question relies on a shared context, include its 'contextId'.
 
     OUTPUT JSON FORMAT:
@@ -52,7 +56,7 @@ export const analyzeTestPage = async (base64Image: string, mimeType: string): Pr
 
   try {
     const response = await ai.models.generateContent({
-      model: "gemini-3-pro-preview", 
+      model: "gemini-3.1-pro-preview", 
       contents: {
         parts: [
           {
@@ -68,7 +72,7 @@ export const analyzeTestPage = async (base64Image: string, mimeType: string): Pr
         responseMimeType: "application/json",
         responseSchema: {
           type: Type.OBJECT,
-          description: "Structured test page data with mapping instructions strictly excluded.",
+          description: "Structured test page data with mapping instructions and page artifacts strictly excluded.",
           properties: {
             pageNumber: { type: Type.STRING },
             testNumber: { type: Type.STRING },

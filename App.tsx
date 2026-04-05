@@ -1,13 +1,17 @@
 import React, { useState, useEffect, useRef, useCallback, useMemo } from 'react';
+import JSZip from 'jszip';
 import Uploader from './components/Uploader';
 import { analyzeTestPage } from './services/geminiService';
 import { QuestionRegion, AppStatus, BoundingBox, PageData } from './types';
-import { LoaderIcon, DownloadIcon, ScissorsIcon } from './components/Icons';
+import { LoaderIcon, DownloadIcon, ScissorsIcon, ZipIcon } from './components/Icons';
 
 export default function App() {
   const [pages, setPages] = useState<PageData[]>([]);
   const [activePageId, setActivePageId] = useState<string | null>(null);
   const [isProcessing, setIsProcessing] = useState(false);
+  const [startTime, setStartTime] = useState<number | null>(null);
+  const [duration, setDuration] = useState<number | null>(null);
+  const [isZipping, setIsZipping] = useState(false);
   
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const containerRef = useRef<HTMLDivElement>(null);
@@ -32,6 +36,8 @@ export default function App() {
     setPages(prev => [...prev, ...newPages]);
     if (!activePageId) setActivePageId(newPages[0].id);
     setIsProcessing(true);
+    setStartTime(Date.now());
+    setDuration(null);
   }, [activePageId]);
 
   // Serial processing effect for pages
@@ -40,6 +46,9 @@ export default function App() {
       const pendingPage = pages.find(p => p.status === 'IDLE');
       if (!pendingPage) {
         setIsProcessing(false);
+        if (startTime) {
+          setDuration(Math.round((Date.now() - startTime) / 1000));
+        }
         return;
       }
 
@@ -56,12 +65,28 @@ export default function App() {
         const base64 = pendingPage.dataUrl.split(',')[1];
         const result = await analyzeTestPage(base64, pendingPage.file.type);
 
+        // Logic for Test Number Inheritance
+        let finalTestNumber = result.testNumber;
+        let finalTopic = result.topic;
+        
+        const pendingIndex = pages.findIndex(p => p.id === pendingPage.id);
+        const prevPage = pendingIndex > 0 ? pages[pendingIndex - 1] : null;
+
+        if (!finalTestNumber && prevPage && prevPage.testNumber) {
+          const firstQNum = parseInt(result.regions[0]?.questionNumber || '0');
+          // If it doesn't start with 1, it's likely a continuation of the previous test
+          if (firstQNum > 1) {
+            finalTestNumber = prevPage.testNumber;
+            if (!finalTopic) finalTopic = prevPage.topic;
+          }
+        }
+
         const regionsWithData: QuestionRegion[] = result.regions.map(r => ({
           ...r,
           id: generateId(),
           pageNumber: result.pageNumber,
-          testNumber: result.testNumber,
-          topic: result.topic,
+          testNumber: finalTestNumber,
+          topic: finalTopic,
           croppedDataUrl: cropImage(img, r.box, (r as any).contextBox)
         }));
 
@@ -70,8 +95,8 @@ export default function App() {
           status: 'READY', 
           imageObj: img,
           pageNumber: result.pageNumber,
-          testNumber: result.testNumber,
-          topic: result.topic,
+          testNumber: finalTestNumber,
+          topic: finalTopic,
           regions: regionsWithData 
         } : p));
       } catch (err: any) {
@@ -162,13 +187,14 @@ export default function App() {
     const ctx = canvas.getContext('2d');
     if (!ctx) return '';
 
-    const pX = img.width * 0.005, pY = img.height * 0.005;
     const getC = (box: BoundingBox, isQ: boolean) => {
-      const lP = isQ ? img.width * 0.002 : pX; 
-      const sx = Math.max(0, (box.xmin / 1000) * img.width - lP);
-      const sy = Math.max(0, (box.ymin / 1000) * img.height - pY);
-      const sw = Math.min(img.width - sx, ((box.xmax - box.xmin) / 1000) * img.width + (lP + pX));
-      const sh = Math.min(img.height - sy, ((box.ymax - box.ymin) / 1000) * img.height + pY * 2);
+      const padX = isQ ? img.width * 0.002 : img.width * 0.005;
+      const padY = isQ ? img.height * 0.002 : img.height * 0.005;
+      // For questions, we don't add padding to the left (xmin) to avoid re-capturing the number label
+      const sx = Math.max(0, (box.xmin / 1000) * img.width - (isQ ? 0 : padX));
+      const sy = Math.max(0, (box.ymin / 1000) * img.height - padY);
+      const sw = Math.min(img.width - sx, ((box.xmax - box.xmin) / 1000) * img.width + (isQ ? padX : padX * 2));
+      const sh = Math.min(img.height - sy, ((box.ymax - box.ymin) / 1000) * img.height + (padY * 2));
       return { sx, sy, sw, sh };
     };
 
@@ -189,7 +215,11 @@ export default function App() {
   };
 
   const sanitizeFilename = (str: string) => {
-    return str.replace(/[^a-z0-9]/gi, '_').replace(/_+/g, '_').toLowerCase();
+    // Support Turkish characters: ç, ğ, ı, ö, ş, ü
+    return str
+      .replace(/[^a-z0-9çğıöşüÇĞİÖŞÜ]/gi, '_')
+      .replace(/_+/g, '_')
+      .toLowerCase();
   };
 
   const handleDownloadCrop = (region: QuestionRegion) => {
@@ -216,6 +246,36 @@ export default function App() {
         }
       });
     });
+  };
+
+  const handleDownloadZip = async () => {
+    if (allQuestions.length === 0) return;
+    setIsZipping(true);
+    try {
+      const zip = new JSZip();
+      
+      for (const region of allQuestions) {
+        if (region.croppedDataUrl) {
+          const base64Data = region.croppedDataUrl.split(',')[1];
+          const testPart = region.testNumber ? `Test${sanitizeFilename(region.testNumber)}_` : '';
+          const topicPart = region.topic ? `${sanitizeFilename(region.topic)}_` : '';
+          const name = `${testPart}${topicPart}Q${region.questionNumber}_${region.pageNumber}.jpg`;
+          zip.file(name, base64Data, { base64: true });
+        }
+      }
+
+      const content = await zip.generateAsync({ type: 'blob' });
+      const link = document.createElement('a');
+      link.href = URL.createObjectURL(content);
+      link.download = `Q-Crop_Export_${new Date().toISOString().split('T')[0]}.zip`;
+      document.body.appendChild(link);
+      link.click();
+      document.body.removeChild(link);
+    } catch (error) {
+      console.error('Error creating ZIP:', error);
+    } finally {
+      setIsZipping(false);
+    }
   };
 
   const handleSelectRegion = (id: string, pId: string) => {
@@ -317,20 +377,36 @@ export default function App() {
                   <div>
                     <h2 className="text-xl font-black text-slate-900 tracking-tighter">Export Queue</h2>
                     <p className="text-xs text-slate-400 font-bold uppercase tracking-widest mt-1">Files named by Test & Topic</p>
+                    {duration !== null && (
+                      <p className="text-[10px] text-brand-600 font-black uppercase tracking-widest mt-2">
+                        Processed in {duration}s
+                      </p>
+                    )}
                   </div>
                   <span className="bg-slate-900 text-white text-[10px] font-black px-3 py-1.5 rounded-lg">
                     {allQuestions.length} TOTAL
                   </span>
                 </div>
                 
-                <button
-                  onClick={handleDownloadAll}
-                  disabled={allQuestions.length === 0}
-                  className="w-full bg-brand-600 hover:bg-brand-700 text-white font-black py-4 px-4 rounded-2xl flex items-center justify-center gap-3 transition-all disabled:opacity-20 shadow-xl shadow-brand-100 active:scale-[0.97] uppercase text-sm tracking-widest"
-                >
-                  <DownloadIcon className="w-5 h-5" />
-                  Export All (Auto-Named)
-                </button>
+                <div className="flex flex-col gap-3">
+                  <button
+                    onClick={handleDownloadZip}
+                    disabled={allQuestions.length === 0 || isZipping}
+                    className="w-full bg-slate-900 hover:bg-slate-800 text-white font-black py-4 px-4 rounded-2xl flex items-center justify-center gap-3 transition-all disabled:opacity-20 shadow-xl active:scale-[0.97] uppercase text-sm tracking-widest"
+                  >
+                    {isZipping ? <LoaderIcon className="w-5 h-5" /> : <ZipIcon className="w-5 h-5" />}
+                    Download ZIP
+                  </button>
+
+                  <button
+                    onClick={handleDownloadAll}
+                    disabled={allQuestions.length === 0}
+                    className="w-full bg-brand-600 hover:bg-brand-700 text-white font-black py-3 px-4 rounded-2xl flex items-center justify-center gap-3 transition-all disabled:opacity-20 shadow-lg shadow-brand-100 active:scale-[0.97] uppercase text-[11px] tracking-widest"
+                  >
+                    <DownloadIcon className="w-4 h-4" />
+                    Export All (Individual)
+                  </button>
+                </div>
               </div>
 
               <div className="flex-1 overflow-y-auto p-6 space-y-8 no-scrollbar">

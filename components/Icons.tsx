@@ -29,3 +29,9 @@ export const ScissorsIcon = ({ className = "w-6 h-6" }: { className?: string }) 
     <path strokeLinecap="round" strokeLinejoin="round" d="M7.645 6.551A3.75 3.75 0 1 1 11.25 10v4.5A3.75 3.75 0 1 1 7.645 18M11.25 10H18m-6.75 4.5H18" />
   </svg>
 );
+
+export const ZipIcon = ({ className = "w-6 h-6" }: { className?: string }) => (
+  <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" strokeWidth={1.5} stroke="currentColor" className={className}>
+    <path strokeLinecap="round" strokeLinejoin="round" d="M20.25 7.5l-.625 10.632a2.25 2.25 0 01-2.247 2.118H6.622a2.25 2.25 0 01-2.247-2.118L3.75 7.5M10 11.25h4M3.375 7.5h17.25c.621 0 1.125-.504 1.125-1.125v-1.5c0-.621-.504-1.125-1.125-1.125H3.375c-.621 0-1.125.504-1.125 1.125v1.5c0 .621.504 1.125 1.125 1.125z" />
+  </svg>
+);
