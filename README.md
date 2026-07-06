@@ -1,20 +1,39 @@
-<div align="center">
-<img width="1200" height="475" alt="GHBanner" src="https://github.com/user-attachments/assets/0aa67016-6eaf-458a-adb2-6e31a0763ed6" />
-</div>
+# Q-Crop — Smart Question Extractor
 
-# Run and deploy your AI Studio app
+Upload scanned test-book pages, get every question automatically detected,
+cropped, and exported as individually named JPEGs.
 
-This contains everything you need to run your app locally.
+**Runs 100% locally — no AI API, no keys, no token limits.** Page analysis is
+done in the browser with classical layout analysis (ink projections for
+header/footer/column detection) plus [Tesseract.js](https://github.com/naptha/tesseract.js)
+OCR (WASM) to find question-number labels and read page metadata (page number,
+TEST number, topic). Cropping, stitching and export were always local.
 
-View your app in AI Studio: https://ai.studio/apps/drive/1i_UJr8FP8AppuKcL5WKFgVEd2OWsSCwZ
+## Run locally
 
-## Run Locally
+Prerequisites: Node.js
 
-**Prerequisites:**  Node.js
+```bash
+npm install
+npm run dev
+```
 
+Then open the printed URL, select one or more page scans (JPEG/PNG/WebP) and
+export. On first use Tesseract downloads its Turkish language data (~10 MB,
+cached by the browser afterwards).
 
-1. Install dependencies:
-   `npm install`
-2. Set the `GEMINI_API_KEY` in [.env.local](.env.local) to your Gemini API key
-3. Run the app:
-   `npm run dev`
+Notes:
+- Detection is tuned for the standard two-column Turkish test-book layout
+  (numbered questions at each column's left margin, header with unit/topic,
+  page number in the footer).
+- If the footer page number can't be read (stylized fonts), the page number is
+  taken from the filename (e.g. `..._Page_033.jpg` → 33).
+- Export All produces a single ZIP with the naming scheme
+  `Test<NN>_<topic>_Q<N>_<page>.jpg`.
+
+## Legacy Gemini mode
+
+`services/geminiService.ts` still contains the original Gemini-based analyzer
+(unused). The local analyzer in `services/localAnalyzer.ts` returns the same
+result shape, so the two are interchangeable if a cloud/local-LLM fallback is
+ever needed again.

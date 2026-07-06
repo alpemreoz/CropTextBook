@@ -1,6 +1,7 @@
 
 import React, { useCallback, useRef } from 'react';
 import { UploadIcon } from './Icons';
+import { expandFiles } from '../services/fileLoader';
 
 interface UploaderProps {
   onImagesSelected: (files: { dataUrl: string, file: File }[]) => void;
@@ -11,25 +12,13 @@ const Uploader: React.FC<UploaderProps> = ({ onImagesSelected, isLoading }) => {
   const fileInputRef = useRef<HTMLInputElement>(null);
 
   const handleFileChange = useCallback(async (event: React.ChangeEvent<HTMLInputElement>) => {
-    // Explicitly cast the Array.from result to File[] to avoid 'unknown' type errors in the iteration
     const files = Array.from(event.target.files || []) as File[];
-    const results: { dataUrl: string, file: File }[] = [];
-
-    for (const file of files) {
-      if (file.type.startsWith('image/')) {
-        const dataUrl = await new Promise<string>((resolve) => {
-          const reader = new FileReader();
-          reader.onload = (e) => resolve(e.target?.result as string);
-          reader.readAsDataURL(file);
-        });
-        results.push({ dataUrl, file });
-      }
-    }
+    const results = await expandFiles(files);
 
     if (results.length > 0) {
       onImagesSelected(results);
     }
-    
+
     if (fileInputRef.current) fileInputRef.current.value = '';
   }, [onImagesSelected]);
 
@@ -45,7 +34,7 @@ const Uploader: React.FC<UploaderProps> = ({ onImagesSelected, isLoading }) => {
            <UploadIcon className="w-10 h-10" />
         </div>
         <h3 className="text-3xl font-black mb-3 text-slate-800 tracking-tight">Bulk Question Extractor</h3>
-        <p className="text-slate-500 mb-10 text-lg">Select multiple exam pages to crop all questions at once.</p>
+        <p className="text-slate-500 mb-10 text-lg">Select exam page images or a PDF to crop all questions at once.</p>
         
         <div className="inline-flex items-center gap-3 px-6 py-3 bg-brand-600 text-white rounded-2xl font-bold shadow-lg shadow-brand-200 hover:bg-brand-700 transition-all">
           <UploadIcon className="w-5 h-5" />
@@ -56,7 +45,7 @@ const Uploader: React.FC<UploaderProps> = ({ onImagesSelected, isLoading }) => {
           type="file" 
           ref={fileInputRef}
           onChange={handleFileChange}
-          accept="image/jpeg, image/png, image/webp" 
+          accept="image/jpeg, image/png, image/webp, application/pdf"
           className="hidden" 
           multiple
         />

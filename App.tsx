@@ -1,8 +1,24 @@
 import React, { useState, useEffect, useRef, useCallback, useMemo } from 'react';
 import Uploader from './components/Uploader';
-import { analyzeTestPage } from './services/geminiService';
+import { analyzeTestPageLocal } from './services/localAnalyzer';
+import { expandFiles } from './services/fileLoader';
 import { QuestionRegion, AppStatus, BoundingBox, PageData } from './types';
-import { LoaderIcon, DownloadIcon, ScissorsIcon } from './components/Icons';
+import { LoaderIcon, DownloadIcon, ScissorsIcon, TrashIcon, PlusIcon } from './components/Icons';
+
+type ResizeHandle = 'nw' | 'n' | 'ne' | 'e' | 'se' | 's' | 'sw' | 'w';
+
+type DragState =
+  | { mode: 'move'; regionId: string; startNX: number; startNY: number; origBox: BoundingBox }
+  | { mode: 'resize'; regionId: string; handle: ResizeHandle; origBox: BoundingBox }
+  | { mode: 'create'; startNX: number; startNY: number };
+
+const MIN_BOX = 10; // minimum box size in 0-1000 units
+
+const handlePoints = (b: BoundingBox): [ResizeHandle, number, number][] => [
+  ['nw', b.xmin, b.ymin], ['n', (b.xmin + b.xmax) / 2, b.ymin], ['ne', b.xmax, b.ymin],
+  ['e', b.xmax, (b.ymin + b.ymax) / 2], ['se', b.xmax, b.ymax], ['s', (b.xmin + b.xmax) / 2, b.ymax],
+  ['sw', b.xmin, b.ymax], ['w', b.xmin, (b.ymin + b.ymax) / 2],
+];
 
 export default function App() {
   const [pages, setPages] = useState<PageData[]>([]);
@@ -11,6 +27,21 @@ export default function App() {
   
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const containerRef = useRef<HTMLDivElement>(null);
+  const [containerSize, setContainerSize] = useState({ w: 0, h: 0 });
+  const [addMode, setAddMode] = useState(false);
+  const [draftBox, setDraftBox] = useState<BoundingBox | null>(null);
+  const dragRef = useRef<DragState | null>(null);
+
+  // Redraw the canvas when the container is resized (or first laid out).
+  useEffect(() => {
+    if (!containerRef.current) return;
+    const obs = new ResizeObserver(entries => {
+      const { width, height } = entries[0].contentRect;
+      setContainerSize({ w: width, h: height });
+    });
+    obs.observe(containerRef.current);
+    return () => obs.disconnect();
+  }, [pages.length > 0]);
 
   const generateId = () => Math.random().toString(36).substr(2, 9);
 
@@ -34,6 +65,19 @@ export default function App() {
     setIsProcessing(true);
   }, [activePageId]);
 
+  // Dev-only hook: lets automated tests feed sample pages without the file picker.
+  useEffect(() => {
+    if (!import.meta.env.DEV) return;
+    (window as any).__qcropLoadSamples = async (urls: string[]) => {
+      const files: File[] = [];
+      for (const url of urls) {
+        const blob = await (await fetch(url)).blob();
+        files.push(new File([blob], decodeURIComponent(url.split('/').pop() || 'page.jpg'), { type: blob.type }));
+      }
+      handleImagesSelected(await expandFiles(files));
+    };
+  }, [handleImagesSelected]);
+
   // Serial processing effect for pages
   useEffect(() => {
     const processNext = async () => {
@@ -53,8 +97,15 @@ export default function App() {
           img.onerror = reject;
         });
 
-        const base64 = pendingPage.dataUrl.split(',')[1];
-        const result = await analyzeTestPage(base64, pendingPage.file.type);
+        const result = await analyzeTestPageLocal(img);
+
+        // Scans are usually named after their page ("..._Page_033.jpg").
+        // The filename wins over OCR: the stylized footer digits can misread
+        // to a wrong-but-plausible number (e.g. seven-segment 64 -> 84).
+        // Requiring the page/sayfa keyword keeps PDF page indices and camera
+        // filenames (IMG_1234) from being mistaken for book pages.
+        const m = /(?:page|sayfa)[_\s-]*(\d{1,4})/i.exec(pendingPage.file.name);
+        if (m) result.pageNumber = String(parseInt(m[1], 10));
 
         const regionsWithData: QuestionRegion[] = result.regions.map(r => ({
           ...r,
@@ -154,8 +205,28 @@ export default function App() {
         ctx.fillRect(startX, startY - 20 > 0 ? startY - 20 : startY, textMetrics.width + 12, 20);
         ctx.fillStyle = 'white'; ctx.fillText(text, startX + 6, (startY - 20 > 0 ? startY - 6 : startY + 14));
       });
+
+      // Resize handles on the selected box
+      const sel = regions.find(r => r.isSelected);
+      if (sel) {
+        handlePoints(sel.box).forEach(([, hx, hy]) => {
+          const px = (hx / 1000) * drawWidth, py = (hy / 1000) * drawHeight;
+          ctx.fillStyle = '#fff'; ctx.strokeStyle = '#16a34a'; ctx.lineWidth = 1.5;
+          ctx.fillRect(px - 5, py - 5, 10, 10);
+          ctx.strokeRect(px - 5, py - 5, 10, 10);
+        });
+      }
+
+      // Draft box while drawing a new region
+      if (draftBox) {
+        ctx.beginPath();
+        ctx.rect((draftBox.xmin / 1000) * drawWidth, (draftBox.ymin / 1000) * drawHeight,
+          ((draftBox.xmax - draftBox.xmin) / 1000) * drawWidth, ((draftBox.ymax - draftBox.ymin) / 1000) * drawHeight);
+        ctx.setLineDash([6, 4]); ctx.strokeStyle = '#16a34a'; ctx.lineWidth = 2; ctx.stroke(); ctx.setLineDash([]);
+        ctx.fillStyle = 'rgba(34, 197, 94, 0.08)'; ctx.fill();
+      }
     }
-  }, [activePage, containerRef.current?.clientWidth, containerRef.current?.clientHeight]);
+  }, [activePage, containerSize, draftBox]);
 
   const cropImage = (img: HTMLImageElement, qBox: BoundingBox, cBox?: BoundingBox): string => {
     const canvas = document.createElement('canvas');
@@ -188,6 +259,127 @@ export default function App() {
     return canvas.toDataURL('image/jpeg', 0.92);
   };
 
+  // --- Manual region editing -------------------------------------------------
+
+  const canvasNorm = (e: React.MouseEvent) => {
+    const rect = canvasRef.current!.getBoundingClientRect();
+    return {
+      nx: Math.max(0, Math.min(1000, ((e.clientX - rect.left) / rect.width) * 1000)),
+      ny: Math.max(0, Math.min(1000, ((e.clientY - rect.top) / rect.height) * 1000)),
+      tolX: (12 / rect.width) * 1000,
+      tolY: (12 / rect.height) * 1000,
+    };
+  };
+
+  const updateRegionBox = (regionId: string, box: BoundingBox) => {
+    setPages(prev => prev.map(p => p.id !== activePageId ? p : {
+      ...p, regions: p.regions.map(r => r.id === regionId ? { ...r, box } : r)
+    }));
+  };
+
+  const refreshCrop = (regionId: string) => {
+    setPages(prev => prev.map(p => {
+      if (p.id !== activePageId || !p.imageObj) return p;
+      return {
+        ...p, regions: p.regions.map(r => r.id === regionId
+          ? { ...r, croppedDataUrl: cropImage(p.imageObj!, r.box, r.contextBox) } : r)
+      };
+    }));
+  };
+
+  const handleDeleteRegion = (regionId: string, pageId: string) => {
+    setPages(prev => prev.map(p => p.id !== pageId ? p : {
+      ...p, regions: p.regions.filter(r => r.id !== regionId)
+    }));
+  };
+
+  const handleCanvasMouseDown = (e: React.MouseEvent) => {
+    if (!activePage || activePage.status !== 'READY') return;
+    const { nx, ny, tolX, tolY } = canvasNorm(e);
+
+    if (addMode) {
+      dragRef.current = { mode: 'create', startNX: nx, startNY: ny };
+      setDraftBox({ xmin: nx, ymin: ny, xmax: nx, ymax: ny });
+      return;
+    }
+
+    const sel = activePage.regions.find(r => r.isSelected);
+    if (sel) {
+      for (const [handle, hx, hy] of handlePoints(sel.box)) {
+        if (Math.abs(nx - hx) <= tolX && Math.abs(ny - hy) <= tolY) {
+          dragRef.current = { mode: 'resize', regionId: sel.id, handle, origBox: { ...sel.box } };
+          return;
+        }
+      }
+    }
+
+    const hit = [...activePage.regions].reverse().find(r =>
+      nx >= r.box.xmin && nx <= r.box.xmax && ny >= r.box.ymin && ny <= r.box.ymax);
+    if (hit) {
+      if (!hit.isSelected) handleSelectRegion(hit.id, activePage.id);
+      dragRef.current = { mode: 'move', regionId: hit.id, startNX: nx, startNY: ny, origBox: { ...hit.box } };
+    }
+  };
+
+  const handleCanvasMouseMove = (e: React.MouseEvent) => {
+    const drag = dragRef.current;
+    if (!drag || !activePage) return;
+    const { nx, ny } = canvasNorm(e);
+
+    if (drag.mode === 'create') {
+      setDraftBox({
+        xmin: Math.min(drag.startNX, nx), ymin: Math.min(drag.startNY, ny),
+        xmax: Math.max(drag.startNX, nx), ymax: Math.max(drag.startNY, ny),
+      });
+    } else if (drag.mode === 'move') {
+      const w = drag.origBox.xmax - drag.origBox.xmin;
+      const h = drag.origBox.ymax - drag.origBox.ymin;
+      const xmin = Math.max(0, Math.min(1000 - w, drag.origBox.xmin + nx - drag.startNX));
+      const ymin = Math.max(0, Math.min(1000 - h, drag.origBox.ymin + ny - drag.startNY));
+      updateRegionBox(drag.regionId, { xmin, ymin, xmax: xmin + w, ymax: ymin + h });
+    } else {
+      const b = { ...drag.origBox };
+      if (drag.handle.includes('w')) b.xmin = Math.min(nx, b.xmax - MIN_BOX);
+      if (drag.handle.includes('e')) b.xmax = Math.max(nx, b.xmin + MIN_BOX);
+      if (drag.handle.includes('n')) b.ymin = Math.min(ny, b.ymax - MIN_BOX);
+      if (drag.handle.includes('s')) b.ymax = Math.max(ny, b.ymin + MIN_BOX);
+      updateRegionBox(drag.regionId, b);
+    }
+  };
+
+  const handleCanvasMouseUp = () => {
+    const drag = dragRef.current;
+    dragRef.current = null;
+    if (!drag || !activePage) { setDraftBox(null); return; }
+
+    if (drag.mode === 'create') {
+      const b = draftBox;
+      setDraftBox(null);
+      setAddMode(false);
+      if (!b || b.xmax - b.xmin < MIN_BOX || b.ymax - b.ymin < MIN_BOX || !activePage.imageObj) return;
+      const box: BoundingBox = {
+        xmin: Math.round(b.xmin), ymin: Math.round(b.ymin),
+        xmax: Math.round(b.xmax), ymax: Math.round(b.ymax),
+      };
+      const nums = activePage.regions.map(r => parseInt(r.questionNumber, 10)).filter(n => !isNaN(n));
+      const newRegion: QuestionRegion = {
+        id: generateId(),
+        questionNumber: String((nums.length ? Math.max(...nums) : 0) + 1),
+        pageNumber: activePage.pageNumber,
+        testNumber: activePage.testNumber,
+        topic: activePage.topic,
+        box,
+        croppedDataUrl: cropImage(activePage.imageObj, box),
+        isSelected: true,
+      };
+      setPages(prev => prev.map(p => p.id !== activePage.id ? p : {
+        ...p, regions: [...p.regions.map(r => ({ ...r, isSelected: false })), newRegion]
+      }));
+    } else {
+      refreshCrop(drag.regionId);
+    }
+  };
+
   const sanitizeFilename = (str: string) => {
     return str.replace(/[^a-z0-9]/gi, '_').replace(/_+/g, '_').toLowerCase();
   };
@@ -196,26 +388,32 @@ export default function App() {
     if (!region.croppedDataUrl) return;
     const link = document.createElement('a');
     link.href = region.croppedDataUrl;
-    
-    // Complex filename convention
-    const testPart = region.testNumber ? `Test${sanitizeFilename(region.testNumber)}_` : '';
-    const topicPart = region.topic ? `${sanitizeFilename(region.topic)}_` : '';
-    const name = `${testPart}${topicPart}Q${region.questionNumber}_${region.pageNumber}.jpg`;
-    
-    link.download = name;
+    link.download = cropFilename(region);
     document.body.appendChild(link); link.click(); document.body.removeChild(link);
   };
 
-  const handleDownloadAll = () => {
-    let count = 0;
+  const cropFilename = (region: QuestionRegion) => {
+    const testPart = region.testNumber ? `Test${sanitizeFilename(region.testNumber)}_` : '';
+    const topicPart = region.topic ? `${sanitizeFilename(region.topic)}_` : '';
+    return `${testPart}${topicPart}Q${region.questionNumber}_${region.pageNumber}.jpg`;
+  };
+
+  const handleDownloadAll = async () => {
+    const { default: JSZip } = await import('jszip');
+    const zip = new JSZip();
     pages.forEach(page => {
       page.regions.forEach(region => {
         if (region.croppedDataUrl) {
-          setTimeout(() => handleDownloadCrop(region), count * 200);
-          count++;
+          zip.file(cropFilename(region), region.croppedDataUrl.split(',')[1], { base64: true });
         }
       });
     });
+    const blob = await zip.generateAsync({ type: 'blob' });
+    const link = document.createElement('a');
+    link.href = URL.createObjectURL(blob);
+    link.download = 'q-crop-export.zip';
+    document.body.appendChild(link); link.click(); document.body.removeChild(link);
+    URL.revokeObjectURL(link.href);
   };
 
   const handleSelectRegion = (id: string, pId: string) => {
@@ -273,8 +471,26 @@ export default function App() {
 
             <div className="flex-1 bg-slate-100 p-6 overflow-hidden relative flex flex-col" ref={containerRef}>
                 <div className="flex-1 flex items-center justify-center relative shadow-2xl bg-slate-300/30 rounded-3xl overflow-hidden border border-slate-200/50">
+                    {activePage?.status === 'READY' && (
+                      <button
+                        onClick={() => setAddMode(m => !m)}
+                        className={`absolute top-4 left-4 z-20 flex items-center gap-2 px-4 py-2.5 rounded-xl text-xs font-black uppercase tracking-widest shadow-lg transition-all
+                          ${addMode ? 'bg-brand-600 text-white ring-4 ring-brand-200' : 'bg-white text-slate-700 hover:bg-brand-50 hover:text-brand-700'}`}
+                      >
+                        <PlusIcon className="w-4 h-4" />
+                        {addMode ? 'Drag on page to draw box' : 'Add Box'}
+                      </button>
+                    )}
                     {activePage?.imageObj ? (
-                      <canvas ref={canvasRef} className="block max-w-full max-h-full shadow-2xl bg-white" />
+                      <canvas
+                        ref={canvasRef}
+                        className="block max-w-full max-h-full shadow-2xl bg-white"
+                        style={{ cursor: addMode ? 'crosshair' : 'default' }}
+                        onMouseDown={handleCanvasMouseDown}
+                        onMouseMove={handleCanvasMouseMove}
+                        onMouseUp={handleCanvasMouseUp}
+                        onMouseLeave={handleCanvasMouseUp}
+                      />
                     ) : (
                       <div className="flex flex-col items-center gap-4">
                         <LoaderIcon className="w-12 h-12 text-brand-500" />
@@ -367,12 +583,20 @@ export default function App() {
                               {region.testNumber ? `Test ${region.testNumber}` : ''}
                             </span>
                           </div>
-                          <button
-                            onClick={(e) => { e.stopPropagation(); handleDownloadCrop(region); }}
-                            className="text-slate-400 hover:text-brand-600 p-2 rounded-xl hover:bg-white transition-all"
-                          >
-                             <DownloadIcon className="w-5 h-5" />
-                          </button>
+                          <div className="flex items-center">
+                            <button
+                              onClick={(e) => { e.stopPropagation(); handleDownloadCrop(region); }}
+                              className="text-slate-400 hover:text-brand-600 p-2 rounded-xl hover:bg-white transition-all"
+                            >
+                               <DownloadIcon className="w-5 h-5" />
+                            </button>
+                            <button
+                              onClick={(e) => { e.stopPropagation(); handleDeleteRegion(region.id, page.id); }}
+                              className="text-slate-400 hover:text-red-600 p-2 rounded-xl hover:bg-white transition-all"
+                            >
+                               <TrashIcon className="w-5 h-5" />
+                            </button>
+                          </div>
                         </div>
                         
                         <div className="bg-white p-4">
