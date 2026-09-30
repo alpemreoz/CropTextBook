@@ -1,12 +1,30 @@
-// Expands user-selected files into page images: images pass through as data
-// URLs, PDFs are rendered page-by-page at high resolution. PDF pages are
-// named without a "page" keyword on purpose — the PDF page index rarely
-// matches the printed book page, so App's filename fallback must not pick it
-// up; the footer OCR reads the real page number from the crisp render.
+import { normalizePdfTextItems } from '../core/qcropCore.mjs';
+
+// Expands user-selected files into pages. Images pass through as data URLs.
+// PDFs become one lazy page each: rendering and text-layer extraction happen
+// in `load()` when the page's turn comes, so a 160-page book shows up
+// instantly and only one full-resolution render is in flight at a time.
+
+/** Text-layer item with coordinates as fractions of the page. */
+export interface PdfTextItem {
+  str: string;
+  x0: number;
+  y0: number;
+  x1: number;
+  y1: number;
+}
+
+export interface PdfPageRef {
+  source: string;
+  pageIndex: number;
+  load: () => Promise<{ dataUrl: string; textItems: PdfTextItem[] }>;
+}
 
 export interface LoadedPage {
+  /** Empty for PDF pages until `pdf.load()` runs. */
   dataUrl: string;
   file: File;
+  pdf?: PdfPageRef;
 }
 
 const PDF_RENDER_TARGET = 2600; // px longest side; plenty for OCR + crops
@@ -25,14 +43,14 @@ const expandPdf = async (file: File): Promise<LoadedPage[]> => {
 
   const doc = await pdfjs.getDocument({ data: await file.arrayBuffer() }).promise;
   const baseName = file.name.replace(/\.pdf$/i, '');
-  const pages: LoadedPage[] = [];
 
-  for (let i = 1; i <= doc.numPages; i++) {
+  const load = async (i: number) => {
     const page = await doc.getPage(i);
     const unit = page.getViewport({ scale: 1 });
+    const textItems = normalizePdfTextItems((await page.getTextContent()).items, unit);
+
     const scale = PDF_RENDER_TARGET / Math.max(unit.width, unit.height);
     const viewport = page.getViewport({ scale });
-
     const canvas = document.createElement('canvas');
     canvas.width = Math.round(viewport.width);
     canvas.height = Math.round(viewport.height);
@@ -40,17 +58,21 @@ const expandPdf = async (file: File): Promise<LoadedPage[]> => {
     ctx.fillStyle = '#fff';
     ctx.fillRect(0, 0, canvas.width, canvas.height);
     await page.render({ canvasContext: ctx, viewport }).promise;
-
-    const dataUrl = canvas.toDataURL('image/jpeg', 0.92);
-    const blob = await (await fetch(dataUrl)).blob();
-    pages.push({
-      dataUrl,
-      file: new File([blob], `${baseName} (p${i}).jpg`, { type: 'image/jpeg' }),
-    });
     page.cleanup();
-  }
-  await doc.destroy();
-  return pages;
+    // A blob URL keeps the JPEG out of the JS heap (base64 strings of a
+    // whole book add up to hundreds of MB).
+    const blob = await new Promise<Blob>((resolve, reject) =>
+      canvas.toBlob(b => (b ? resolve(b) : reject(new Error('render failed'))), 'image/jpeg', 0.92));
+    return { dataUrl: URL.createObjectURL(blob), textItems };
+  };
+
+  return Array.from({ length: doc.numPages }, (_, k) => ({
+    dataUrl: '',
+    // Named without a "page" keyword on purpose: the PDF page index is used
+    // as-is (s<index>), never parsed back out of the filename.
+    file: new File([], `${baseName} (p${k + 1}).jpg`, { type: 'image/jpeg' }),
+    pdf: { source: file.name, pageIndex: k + 1, load: () => load(k + 1) },
+  }));
 };
 
 export const expandFiles = async (files: File[]): Promise<LoadedPage[]> => {

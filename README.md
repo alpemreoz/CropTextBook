@@ -1,13 +1,14 @@
 # Q-Crop — Smart Question Extractor
 
-Upload scanned test-book pages, get every question automatically detected,
-cropped, and exported as individually named JPEGs.
+Upload test-book pages (scans or a PDF), get every multiple-choice question
+automatically detected, cropped, and exported as individually named JPEGs.
 
-**Runs 100% locally — no AI API, no keys, no token limits.** Page analysis is
-done in the browser with classical layout analysis (ink projections for
-header/footer/column detection) plus [Tesseract.js](https://github.com/naptha/tesseract.js)
-OCR (WASM) to find question-number labels and read page metadata (page number,
-TEST number, topic). Cropping, stitching and export were always local.
+**Runs 100% locally — no AI API, no keys, no token limits.** Page analysis
+uses classical layout analysis (ink projections for header/footer/column
+detection) plus the page's text: a PDF's own text layer when it has one
+(exact and fast), otherwise [Tesseract.js](https://github.com/naptha/tesseract.js)
+OCR. The detection logic lives in `core/qcropCore.mjs` and is shared by the
+web app and the CLI.
 
 ## Run locally
 
@@ -18,18 +19,67 @@ npm install
 npm run dev
 ```
 
-Then open the printed URL, select one or more page scans (JPEG/PNG/WebP) and
+Then open the printed URL, select page scans (JPEG/PNG/WebP) or a PDF, and
 export. On first use Tesseract downloads its Turkish language data (~10 MB,
-cached by the browser afterwards).
+cached by the browser afterwards). Keep the tab in the foreground while a PDF
+is processing: browsers pause PDF page rendering in background tabs.
 
-Notes:
-- Detection is tuned for the standard two-column Turkish test-book layout
-  (numbered questions at each column's left margin, header with unit/topic,
-  page number in the footer).
-- If the footer page number can't be read (stylized fonts), the page number is
-  taken from the filename (e.g. `..._Page_033.jpg` → 33).
-- Export All produces a single ZIP with the naming scheme
-  `Test<NN>_<topic>_Q<N>_<page>.jpg`.
+## What gets cropped
+
+- Only **test questions**: a numbered label at a column's left margin whose
+  question has an `A) … E)` option block. Written-exam ("Yazılı Sınav") and
+  activity ("Etkinlik") items are skipped: anything below such a heading, and
+  lettered statement lists that run past E) (true/false exercises).
+- When a question's lines start left of its number (unindented poems), the
+  crop widens to keep them and the number is painted out instead.
+- Each crop runs from the question text through its options, including
+  anything hanging below them (stacked fractions, option tables). It stops at
+  the whitespace before the next block, at anything that starts back at the
+  column margin below the options (a section icon or label), or at a section
+  heading such as "Yazılı Sınav". The number label is excluded.
+- Two-column layouts; a divider that ends where a full-width section starts
+  is handled.
+
+## File names
+
+`[test<NN>_][<topic>_]q<N>_<page>.jpg`, lowercase, Turkish letters kept.
+
+- **Page**: for PDFs, `s` + the PDF page index (unique across the file, e.g.
+  `s104`). For scans, the number in the filename (`..._Page_033.jpg` → `33`),
+  else the footer is OCR'd.
+- **Topic**: the page header's topic (e.g. `kütle_merkezi`); for PDF books
+  whose test pages don't print one, the topic from the most recent unit cover
+  page (the line above the "Adı :" student form); review sections name
+  themselves (`tarama_1`).
+- **Test**: the corner "TEST 04" badge, when the book has one.
+
+Example: `aktif_taşıma_endositoz_ekzositoz_q5_s104.jpg`.
+
+## CLI (headless, faster)
+
+The same pipeline as a Node script — no browser; writes crops straight to one
+output folder:
+
+```bash
+npm run cli -- <PDFs, images or folders...> -o <output-folder>
+# e.g.
+npm run cli -- ./book.pdf -o ./crops
+npm run cli -- ./scans -o ./crops
+```
+
+PDF input needs poppler (`brew install poppler`) for rendering and the text
+layer. PDF pages are rendered at 300 dpi by default; `--dpi 400` (or any
+72–1200) makes crops sharper without changing what's detected. A 161-page
+text-layer PDF takes about 30 s.
+
+Page images (scans, or pages exported from a PDF) go through OCR, about
+0.7 s/page in the CLI and 5 s/page in the browser. Numbered files
+(`Book_Sayfa_001.jpg`, `…_002.jpg`, …) are read as one book in page order,
+so topics come from the unit covers as with a PDF. On images, question
+numbers are read a second time from each column's margin, and questions
+whose options sit beside drawings get two extra option passes (sparse-text
+OCR, then shape-based "A)" detection). When a PDF with real text exists,
+it's still the better input: exact, faster, and sharper crops.
 
 ## Legacy Gemini mode
 

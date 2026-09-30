@@ -13,6 +13,11 @@ dist-ssr
 *.local
 .env
 
+# Q-Crop CLI default output + Tesseract language cache
+q-crop-out
+*.traineddata
+*.traineddata.gz
+
 # Editor directories and files
 .vscode/*
 !.vscode/extensions.json
