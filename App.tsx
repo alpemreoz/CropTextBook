@@ -1,8 +1,33 @@
 import React, { useState, useEffect, useRef, useCallback, useMemo } from 'react';
 import Uploader from './components/Uploader';
-import { analyzeTestPage } from './services/geminiService';
+import { analyzeTestPageLocal } from './services/localAnalyzer';
+import { expandFiles, LoadedPage, PDF_EXPORT_DPI } from './services/fileLoader';
+import { cropFileName, resolveTopics, imageSequence, cropRect, maskRect } from './core/qcropCore.mjs';
 import { QuestionRegion, AppStatus, BoundingBox, PageData } from './types';
-import { LoaderIcon, DownloadIcon, ScissorsIcon } from './components/Icons';
+import { LoaderIcon, DownloadIcon, ScissorsIcon, TrashIcon, PlusIcon } from './components/Icons';
+
+type ResizeHandle = 'nw' | 'n' | 'ne' | 'e' | 'se' | 's' | 'sw' | 'w';
+
+type DragState =
+  | { mode: 'move'; regionId: string; startNX: number; startNY: number; origBox: BoundingBox }
+  | { mode: 'resize'; regionId: string; handle: ResizeHandle; origBox: BoundingBox }
+  | { mode: 'create'; startNX: number; startNY: number };
+
+const MIN_BOX = 10; // minimum box size in 0-1000 units
+const MAX_PARALLEL = 3; // pages analyzed at once
+
+/** The book a page belongs to (a PDF, or a numbered image sequence) and its place in it. */
+const bookOf = (p: PageData): { key: string; order: number } | null => {
+  if (p.pdf) return { key: `pdf:${p.pdf.source}`, order: p.pdf.pageIndex };
+  const seq = imageSequence(p.file.name);
+  return seq ? { key: `img:${seq.key}`, order: seq.index } : null;
+};
+
+const handlePoints = (b: BoundingBox): [ResizeHandle, number, number][] => [
+  ['nw', b.xmin, b.ymin], ['n', (b.xmin + b.xmax) / 2, b.ymin], ['ne', b.xmax, b.ymin],
+  ['e', b.xmax, (b.ymin + b.ymax) / 2], ['se', b.xmax, b.ymax], ['s', (b.xmin + b.xmax) / 2, b.ymax],
+  ['sw', b.xmin, b.ymax], ['w', b.xmin, (b.ymin + b.ymax) / 2],
+];
 
 export default function App() {
   const [pages, setPages] = useState<PageData[]>([]);
@@ -11,18 +36,58 @@ export default function App() {
   
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const containerRef = useRef<HTMLDivElement>(null);
+  const [containerSize, setContainerSize] = useState({ w: 0, h: 0 });
+  const [addMode, setAddMode] = useState(false);
+  const [draftBox, setDraftBox] = useState<BoundingBox | null>(null);
+  const [exportProgress, setExportProgress] = useState<string | null>(null);
+  const dragRef = useRef<DragState | null>(null);
+
+  // Redraw the canvas when the container is resized (or first laid out).
+  useEffect(() => {
+    if (!containerRef.current) return;
+    const obs = new ResizeObserver(entries => {
+      const { width, height } = entries[0].contentRect;
+      setContainerSize({ w: width, h: height });
+    });
+    obs.observe(containerRef.current);
+    return () => obs.disconnect();
+  }, [pages.length > 0]);
 
   const generateId = () => Math.random().toString(36).substr(2, 9);
 
-  const activePage = useMemo(() => 
+  const activePage = useMemo(() =>
     pages.find(p => p.id === activePageId), [pages, activePageId]
   );
 
-  const handleImagesSelected = useCallback(async (newFiles: { dataUrl: string, file: File }[]) => {
+  // Effective topic per page. Pages are analyzed concurrently, so
+  // inheritance from unit covers is derived from state rather than at
+  // analysis time: within one PDF, in document order, a page without its own
+  // topic takes the most recent cover's.
+  const topicByPage = useMemo(() => {
+    const out = new Map<string, string | undefined>();
+    const byBook = new Map<string, { page: PageData; order: number }[]>();
+    for (const p of pages) {
+      const book = bookOf(p);
+      if (!book) { out.set(p.id, p.topic); continue; }
+      if (!byBook.has(book.key)) byBook.set(book.key, []);
+      byBook.get(book.key)!.push({ page: p, order: book.order });
+    }
+    for (const group of byBook.values()) {
+      group.sort((a, b) => a.order - b.order);
+      const resolved = resolveTopics(group.map(({ page: p }) => ({
+        section: p.section, headerTopic: p.topic, coverTopic: p.coverTopic,
+      })));
+      group.forEach(({ page }, i) => out.set(page.id, resolved[i]));
+    }
+    return out;
+  }, [pages]);
+
+  const handleImagesSelected = useCallback(async (newFiles: LoadedPage[]) => {
     const newPages: PageData[] = newFiles.map(f => ({
       id: generateId(),
       file: f.file,
       dataUrl: f.dataUrl,
+      pdf: f.pdf,
       imageObj: null,
       status: 'IDLE',
       regions: [],
@@ -34,57 +99,112 @@ export default function App() {
     setIsProcessing(true);
   }, [activePageId]);
 
-  // Serial processing effect for pages
+  // Dev-only hook: lets automated tests feed sample pages without the file picker.
   useEffect(() => {
-    const processNext = async () => {
-      const pendingPage = pages.find(p => p.status === 'IDLE');
-      if (!pendingPage) {
-        setIsProcessing(false);
-        return;
+    if (!import.meta.env.DEV) return;
+    (window as any).__qcropLoadSamples = async (urls: string[]) => {
+      const files: File[] = [];
+      for (const url of urls) {
+        const blob = await (await fetch(url)).blob();
+        files.push(new File([blob], decodeURIComponent(url.split('/').pop() || 'page.jpg'), { type: blob.type }));
       }
-
-      setPages(prev => prev.map(p => p.id === pendingPage.id ? { ...p, status: 'ANALYZING' } : p));
-
-      try {
-        const img = new Image();
-        img.src = pendingPage.dataUrl;
-        await new Promise((resolve, reject) => {
-          img.onload = resolve;
-          img.onerror = reject;
-        });
-
-        const base64 = pendingPage.dataUrl.split(',')[1];
-        const result = await analyzeTestPage(base64, pendingPage.file.type);
-
-        const regionsWithData: QuestionRegion[] = result.regions.map(r => ({
-          ...r,
-          id: generateId(),
-          pageNumber: result.pageNumber,
-          testNumber: result.testNumber,
-          topic: result.topic,
-          croppedDataUrl: cropImage(img, r.box, (r as any).contextBox)
-        }));
-
-        setPages(prev => prev.map(p => p.id === pendingPage.id ? { 
-          ...p, 
-          status: 'READY', 
-          imageObj: img,
-          pageNumber: result.pageNumber,
-          testNumber: result.testNumber,
-          topic: result.topic,
-          regions: regionsWithData 
-        } : p));
-      } catch (err: any) {
-        setPages(prev => prev.map(p => p.id === pendingPage.id ? { 
-          ...p, 
-          status: 'ERROR', 
-          error: err.message 
-        } : p));
-      }
+      handleImagesSelected(await expandFiles(files));
     };
+    (window as any).__qcropAddPages = handleImagesSelected;
+  }, [handleImagesSelected]);
 
-    if (isProcessing) processNext();
+  // Page processing pool: at most MAX_PARALLEL pages in flight. The in-flight
+  // set lives in a ref so a status update can't re-dispatch a page, and each
+  // page is started from the effect instead of from another page's update
+  // (a chain of those overflows React's update depth on large PDFs).
+  const inFlight = useRef(new Set<string>());
+  useEffect(() => {
+    if (!isProcessing) return;
+    const idle = pages.filter(p => p.status === 'IDLE' && !inFlight.current.has(p.id));
+    if (idle.length === 0) {
+      if (inFlight.current.size === 0) setIsProcessing(false);
+      return;
+    }
+    const batch = idle.slice(0, MAX_PARALLEL - inFlight.current.size);
+    if (batch.length === 0) return;
+    const ids = new Set(batch.map(p => p.id));
+    ids.forEach(id => inFlight.current.add(id));
+    setPages(prev => prev.map(p => ids.has(p.id) ? { ...p, status: 'ANALYZING' } : p));
+    batch.forEach(processPage);
   }, [pages, isProcessing]);
+
+  async function processPage(pendingPage: PageData) {
+    try {
+      let dataUrl = pendingPage.dataUrl;
+      let textItems;
+      if (pendingPage.pdf) {
+        ({ dataUrl, textItems } = await pendingPage.pdf.load());
+      }
+
+      const img = new Image();
+      img.src = dataUrl;
+      await new Promise((resolve, reject) => {
+        img.onload = resolve;
+        img.onerror = reject;
+      });
+
+      const result = await analyzeTestPageLocal(img, textItems, { bookPage: !!bookOf(pendingPage) });
+
+      let pageNumber = result.pageNumber;
+      let pageLabel: string;
+      if (pendingPage.pdf) {
+        // The PDF page index is unique across the book; printed numbers
+        // restart in some books.
+        pageNumber = String(pendingPage.pdf.pageIndex);
+        pageLabel = `s${pageNumber}`;
+      } else {
+        // Scans are usually named after their page ("..._Page_033.jpg").
+        // The filename wins over OCR: the stylized footer digits can misread
+        // to a wrong-but-plausible number (e.g. seven-segment 64 -> 84).
+        // Requiring the page/sayfa keyword keeps camera filenames
+        // (IMG_1234) from being mistaken for book pages.
+        const m = /(?:page|sayfa)[_\s-]*(\d{1,4})/i.exec(pendingPage.file.name);
+        if (m) pageNumber = String(parseInt(m[1], 10));
+        pageLabel = pageNumber;
+      }
+
+      // The page's own topic; PDF pages without one inherit a unit cover's
+      // topic in `topicByPage`, once all pages are done.
+      const topic = result.topic;
+
+      const regionsWithData: QuestionRegion[] = result.regions.map(r => ({
+        ...r,
+        id: generateId(),
+        pageNumber,
+        pageLabel,
+        testNumber: result.testNumber,
+        topic,
+        croppedDataUrl: cropImage(img, r.box, (r as any).contextBox, r.mask)
+      }));
+
+      inFlight.current.delete(pendingPage.id);
+      setPages(prev => prev.map(p => p.id === pendingPage.id ? {
+        ...p,
+        status: 'READY',
+        dataUrl,
+        imageObj: img,
+        pageNumber,
+        pageLabel,
+        testNumber: result.testNumber,
+        topic,
+        coverTopic: result.coverTopic,
+        section: result.section,
+        regions: regionsWithData
+      } : p));
+    } catch (err: any) {
+      inFlight.current.delete(pendingPage.id);
+      setPages(prev => prev.map(p => p.id === pendingPage.id ? {
+        ...p,
+        status: 'ERROR',
+        error: err.message
+      } : p));
+    }
+  }
 
   // Canvas Drawing Logic
   useEffect(() => {
@@ -154,68 +274,253 @@ export default function App() {
         ctx.fillRect(startX, startY - 20 > 0 ? startY - 20 : startY, textMetrics.width + 12, 20);
         ctx.fillStyle = 'white'; ctx.fillText(text, startX + 6, (startY - 20 > 0 ? startY - 6 : startY + 14));
       });
-    }
-  }, [activePage, containerRef.current?.clientWidth, containerRef.current?.clientHeight]);
 
-  const cropImage = (img: HTMLImageElement, qBox: BoundingBox, cBox?: BoundingBox): string => {
+      // Resize handles on the selected box
+      const sel = regions.find(r => r.isSelected);
+      if (sel) {
+        handlePoints(sel.box).forEach(([, hx, hy]) => {
+          const px = (hx / 1000) * drawWidth, py = (hy / 1000) * drawHeight;
+          ctx.fillStyle = '#fff'; ctx.strokeStyle = '#16a34a'; ctx.lineWidth = 1.5;
+          ctx.fillRect(px - 5, py - 5, 10, 10);
+          ctx.strokeRect(px - 5, py - 5, 10, 10);
+        });
+      }
+
+      // Draft box while drawing a new region
+      if (draftBox) {
+        ctx.beginPath();
+        ctx.rect((draftBox.xmin / 1000) * drawWidth, (draftBox.ymin / 1000) * drawHeight,
+          ((draftBox.xmax - draftBox.xmin) / 1000) * drawWidth, ((draftBox.ymax - draftBox.ymin) / 1000) * drawHeight);
+        ctx.setLineDash([6, 4]); ctx.strokeStyle = '#16a34a'; ctx.lineWidth = 2; ctx.stroke(); ctx.setLineDash([]);
+        ctx.fillStyle = 'rgba(34, 197, 94, 0.08)'; ctx.fill();
+      }
+    }
+  }, [activePage, containerSize, draftBox]);
+
+  const cropImage = (img: HTMLImageElement, qBox: BoundingBox, cBox?: BoundingBox, mask?: BoundingBox): string => {
     const canvas = document.createElement('canvas');
     const ctx = canvas.getContext('2d');
     if (!ctx) return '';
 
     const pX = img.width * 0.005, pY = img.height * 0.005;
-    const getC = (box: BoundingBox, isQ: boolean) => {
-      const lP = isQ ? img.width * 0.002 : pX; 
-      const sx = Math.max(0, (box.xmin / 1000) * img.width - lP);
+    const getC = (box: BoundingBox) => {
+      const sx = Math.max(0, (box.xmin / 1000) * img.width - pX);
       const sy = Math.max(0, (box.ymin / 1000) * img.height - pY);
-      const sw = Math.min(img.width - sx, ((box.xmax - box.xmin) / 1000) * img.width + (lP + pX));
+      const sw = Math.min(img.width - sx, ((box.xmax - box.xmin) / 1000) * img.width + pX * 2);
       const sh = Math.min(img.height - sy, ((box.ymax - box.ymin) / 1000) * img.height + pY * 2);
       return { sx, sy, sw, sh };
     };
 
-    const q = getC(qBox, true);
+    const q = cropRect(qBox, img.width, img.height);
+    // White out the question number when it falls inside the box.
+    const paintMask = (dx: number, dy: number) => {
+      const m = maskRect(mask, q, img.width, img.height);
+      if (!m) return;
+      ctx.fillStyle = '#fff';
+      ctx.fillRect(dx + m.x, dy + m.y, m.w, m.h);
+    };
     if (!cBox) {
       canvas.width = q.sw; canvas.height = q.sh; ctx.fillStyle = '#fff'; ctx.fillRect(0,0,q.sw,q.sh);
       ctx.drawImage(img, q.sx, q.sy, q.sw, q.sh, 0, 0, q.sw, q.sh);
+      paintMask(0, 0);
     } else {
-      const c = getC(cBox, false); const gap = 40;
+      const c = getC(cBox); const gap = 40;
       canvas.width = Math.max(c.sw, q.sw); canvas.height = c.sh + gap + q.sh;
       ctx.fillStyle = '#fff'; ctx.fillRect(0,0,canvas.width,canvas.height);
       ctx.drawImage(img, c.sx, c.sy, c.sw, c.sh, (canvas.width-c.sw)/2, 0, c.sw, c.sh);
       ctx.beginPath(); ctx.setLineDash([10,10]); ctx.moveTo(30, c.sh+gap/2); ctx.lineTo(canvas.width-30, c.sh+gap/2);
       ctx.strokeStyle = '#e2e8f0'; ctx.lineWidth = 2; ctx.stroke(); ctx.setLineDash([]);
       ctx.drawImage(img, q.sx, q.sy, q.sw, q.sh, (canvas.width-q.sw)/2, c.sh+gap, q.sw, q.sh);
+      paintMask((canvas.width-q.sw)/2, c.sh+gap);
     }
-    return canvas.toDataURL('image/jpeg', 0.92);
+    return canvas.toDataURL('image/jpeg', 0.95);
   };
 
-  const sanitizeFilename = (str: string) => {
-    return str.replace(/[^a-z0-9]/gi, '_').replace(/_+/g, '_').toLowerCase();
+  // --- Manual region editing -------------------------------------------------
+
+  const canvasNorm = (e: React.MouseEvent) => {
+    const rect = canvasRef.current!.getBoundingClientRect();
+    return {
+      nx: Math.max(0, Math.min(1000, ((e.clientX - rect.left) / rect.width) * 1000)),
+      ny: Math.max(0, Math.min(1000, ((e.clientY - rect.top) / rect.height) * 1000)),
+      tolX: (12 / rect.width) * 1000,
+      tolY: (12 / rect.height) * 1000,
+    };
   };
 
-  const handleDownloadCrop = (region: QuestionRegion) => {
-    if (!region.croppedDataUrl) return;
+  const updateRegionBox = (regionId: string, box: BoundingBox) => {
+    setPages(prev => prev.map(p => p.id !== activePageId ? p : {
+      ...p, regions: p.regions.map(r => r.id === regionId ? { ...r, box } : r)
+    }));
+  };
+
+  const refreshCrop = (regionId: string) => {
+    setPages(prev => prev.map(p => {
+      if (p.id !== activePageId || !p.imageObj) return p;
+      return {
+        ...p, regions: p.regions.map(r => r.id === regionId
+          ? { ...r, croppedDataUrl: cropImage(p.imageObj!, r.box, r.contextBox, r.mask) } : r)
+      };
+    }));
+  };
+
+  const handleDeleteRegion = (regionId: string, pageId: string) => {
+    setPages(prev => prev.map(p => p.id !== pageId ? p : {
+      ...p, regions: p.regions.filter(r => r.id !== regionId)
+    }));
+  };
+
+  const handleCanvasMouseDown = (e: React.MouseEvent) => {
+    if (!activePage || activePage.status !== 'READY') return;
+    const { nx, ny, tolX, tolY } = canvasNorm(e);
+
+    if (addMode) {
+      dragRef.current = { mode: 'create', startNX: nx, startNY: ny };
+      setDraftBox({ xmin: nx, ymin: ny, xmax: nx, ymax: ny });
+      return;
+    }
+
+    const sel = activePage.regions.find(r => r.isSelected);
+    if (sel) {
+      for (const [handle, hx, hy] of handlePoints(sel.box)) {
+        if (Math.abs(nx - hx) <= tolX && Math.abs(ny - hy) <= tolY) {
+          dragRef.current = { mode: 'resize', regionId: sel.id, handle, origBox: { ...sel.box } };
+          return;
+        }
+      }
+    }
+
+    const hit = [...activePage.regions].reverse().find(r =>
+      nx >= r.box.xmin && nx <= r.box.xmax && ny >= r.box.ymin && ny <= r.box.ymax);
+    if (hit) {
+      if (!hit.isSelected) handleSelectRegion(hit.id, activePage.id);
+      dragRef.current = { mode: 'move', regionId: hit.id, startNX: nx, startNY: ny, origBox: { ...hit.box } };
+    }
+  };
+
+  const handleCanvasMouseMove = (e: React.MouseEvent) => {
+    const drag = dragRef.current;
+    if (!drag || !activePage) return;
+    const { nx, ny } = canvasNorm(e);
+
+    if (drag.mode === 'create') {
+      setDraftBox({
+        xmin: Math.min(drag.startNX, nx), ymin: Math.min(drag.startNY, ny),
+        xmax: Math.max(drag.startNX, nx), ymax: Math.max(drag.startNY, ny),
+      });
+    } else if (drag.mode === 'move') {
+      const w = drag.origBox.xmax - drag.origBox.xmin;
+      const h = drag.origBox.ymax - drag.origBox.ymin;
+      const xmin = Math.max(0, Math.min(1000 - w, drag.origBox.xmin + nx - drag.startNX));
+      const ymin = Math.max(0, Math.min(1000 - h, drag.origBox.ymin + ny - drag.startNY));
+      updateRegionBox(drag.regionId, { xmin, ymin, xmax: xmin + w, ymax: ymin + h });
+    } else {
+      const b = { ...drag.origBox };
+      if (drag.handle.includes('w')) b.xmin = Math.min(nx, b.xmax - MIN_BOX);
+      if (drag.handle.includes('e')) b.xmax = Math.max(nx, b.xmin + MIN_BOX);
+      if (drag.handle.includes('n')) b.ymin = Math.min(ny, b.ymax - MIN_BOX);
+      if (drag.handle.includes('s')) b.ymax = Math.max(ny, b.ymin + MIN_BOX);
+      updateRegionBox(drag.regionId, b);
+    }
+  };
+
+  const handleCanvasMouseUp = () => {
+    const drag = dragRef.current;
+    dragRef.current = null;
+    if (!drag || !activePage) { setDraftBox(null); return; }
+
+    if (drag.mode === 'create') {
+      const b = draftBox;
+      setDraftBox(null);
+      setAddMode(false);
+      if (!b || b.xmax - b.xmin < MIN_BOX || b.ymax - b.ymin < MIN_BOX || !activePage.imageObj) return;
+      const box: BoundingBox = {
+        xmin: Math.round(b.xmin), ymin: Math.round(b.ymin),
+        xmax: Math.round(b.xmax), ymax: Math.round(b.ymax),
+      };
+      const nums = activePage.regions.map(r => parseInt(r.questionNumber, 10)).filter(n => !isNaN(n));
+      const newRegion: QuestionRegion = {
+        id: generateId(),
+        questionNumber: String((nums.length ? Math.max(...nums) : 0) + 1),
+        pageNumber: activePage.pageNumber,
+        pageLabel: activePage.pageLabel,
+        testNumber: activePage.testNumber,
+        topic: activePage.topic,
+        box,
+        croppedDataUrl: cropImage(activePage.imageObj, box),
+        isSelected: true,
+      };
+      setPages(prev => prev.map(p => p.id !== activePage.id ? p : {
+        ...p, regions: [...p.regions.map(r => ({ ...r, isSelected: false })), newRegion]
+      }));
+    } else {
+      refreshCrop(drag.regionId);
+    }
+  };
+
+  /**
+   * The exported image. PDF crops are rendered again from the PDF at
+   * PDF_EXPORT_DPI (the on-screen preview comes from a smaller page render);
+   * image crops are already cut from the original file at full resolution.
+   */
+  const exportBlob = async (region: QuestionRegion, page: PageData): Promise<Blob | null> => {
+    if (page.pdf && !region.contextBox) {
+      try {
+        const { width, height } = await page.pdf.size(PDF_EXPORT_DPI);
+        const r = cropRect(region.box, width, height);
+        const canvas = await page.pdf.renderRegion(PDF_EXPORT_DPI, r);
+        const m = maskRect(region.mask, r, width, height);
+        if (m) {
+          const ctx = canvas.getContext('2d')!;
+          ctx.fillStyle = '#fff';
+          ctx.fillRect(m.x, m.y, m.w, m.h);
+        }
+        return await new Promise<Blob | null>(res => canvas.toBlob(res, 'image/jpeg', 0.95));
+      } catch (err) {
+        console.warn('High-res render failed; exporting the preview crop', err);
+      }
+    }
+    return region.croppedDataUrl ? (await fetch(region.croppedDataUrl)).blob() : null;
+  };
+
+  const saveBlob = (blob: Blob, name: string) => {
     const link = document.createElement('a');
-    link.href = region.croppedDataUrl;
-    
-    // Complex filename convention
-    const testPart = region.testNumber ? `Test${sanitizeFilename(region.testNumber)}_` : '';
-    const topicPart = region.topic ? `${sanitizeFilename(region.topic)}_` : '';
-    const name = `${testPart}${topicPart}Q${region.questionNumber}_${region.pageNumber}.jpg`;
-    
+    link.href = URL.createObjectURL(blob);
     link.download = name;
     document.body.appendChild(link); link.click(); document.body.removeChild(link);
+    setTimeout(() => URL.revokeObjectURL(link.href), 1000);
   };
 
-  const handleDownloadAll = () => {
-    let count = 0;
-    pages.forEach(page => {
-      page.regions.forEach(region => {
-        if (region.croppedDataUrl) {
-          setTimeout(() => handleDownloadCrop(region), count * 200);
-          count++;
-        }
-      });
-    });
+  const handleDownloadCrop = async (region: QuestionRegion, pageId: string) => {
+    const page = pages.find(p => p.id === pageId);
+    const blob = page && await exportBlob(region, page);
+    if (blob) saveBlob(blob, cropFilename(region, pageId));
+  };
+
+  const cropFilename = (region: QuestionRegion, pageId: string) => cropFileName({
+    testNumber: region.testNumber,
+    topic: topicByPage.get(pageId) ?? region.topic,
+    questionNumber: region.questionNumber,
+    pageLabel: region.pageLabel ?? region.pageNumber,
+  });
+
+  const handleDownloadAll = async () => {
+    if (exportProgress) return;
+    const { default: JSZip } = await import('jszip');
+    const zip = new JSZip();
+    const jobs = pages.flatMap(page => page.regions.filter(r => r.croppedDataUrl).map(region => ({ page, region })));
+    try {
+      for (let i = 0; i < jobs.length; i++) {
+        setExportProgress(`${i + 1} / ${jobs.length}`);
+        const { page, region } = jobs[i];
+        const blob = await exportBlob(region, page);
+        if (blob) zip.file(cropFilename(region, page.id), blob);
+      }
+      setExportProgress('Zipping…');
+      saveBlob(await zip.generateAsync({ type: 'blob' }), 'q-crop-export.zip');
+    } finally {
+      setExportProgress(null);
+    }
   };
 
   const handleSelectRegion = (id: string, pId: string) => {
@@ -263,7 +568,7 @@ export default function App() {
                     ${activePageId === p.id ? 'border-brand-500 scale-110 shadow-lg shadow-brand-500/20' : 'border-slate-700 hover:border-slate-500 opacity-60'}
                   `}
                 >
-                  <img src={p.dataUrl} className="w-full h-full object-cover" />
+                  {p.dataUrl && <img src={p.dataUrl} className="w-full h-full object-cover" />}
                   <div className="absolute inset-0 flex items-center justify-center bg-black/40 text-white text-[10px] font-black uppercase">
                     {p.status === 'ANALYZING' ? <LoaderIcon className="w-4 h-4" /> : `P${p.pageNumber}`}
                   </div>
@@ -273,8 +578,26 @@ export default function App() {
 
             <div className="flex-1 bg-slate-100 p-6 overflow-hidden relative flex flex-col" ref={containerRef}>
                 <div className="flex-1 flex items-center justify-center relative shadow-2xl bg-slate-300/30 rounded-3xl overflow-hidden border border-slate-200/50">
+                    {activePage?.status === 'READY' && (
+                      <button
+                        onClick={() => setAddMode(m => !m)}
+                        className={`absolute top-4 left-4 z-20 flex items-center gap-2 px-4 py-2.5 rounded-xl text-xs font-black uppercase tracking-widest shadow-lg transition-all
+                          ${addMode ? 'bg-brand-600 text-white ring-4 ring-brand-200' : 'bg-white text-slate-700 hover:bg-brand-50 hover:text-brand-700'}`}
+                      >
+                        <PlusIcon className="w-4 h-4" />
+                        {addMode ? 'Drag on page to draw box' : 'Add Box'}
+                      </button>
+                    )}
                     {activePage?.imageObj ? (
-                      <canvas ref={canvasRef} className="block max-w-full max-h-full shadow-2xl bg-white" />
+                      <canvas
+                        ref={canvasRef}
+                        className="block max-w-full max-h-full shadow-2xl bg-white"
+                        style={{ cursor: addMode ? 'crosshair' : 'default' }}
+                        onMouseDown={handleCanvasMouseDown}
+                        onMouseMove={handleCanvasMouseMove}
+                        onMouseUp={handleCanvasMouseUp}
+                        onMouseLeave={handleCanvasMouseUp}
+                      />
                     ) : (
                       <div className="flex flex-col items-center gap-4">
                         <LoaderIcon className="w-12 h-12 text-brand-500" />
@@ -301,10 +624,10 @@ export default function App() {
                           <span className="text-brand-600">Test {activePage.testNumber}</span>
                         </>
                       )}
-                      {activePage?.topic && (
+                      {activePage && topicByPage.get(activePage.id) && (
                         <>
                           <span className="w-1 h-1 bg-slate-300 rounded-full"></span>
-                          <span className="text-slate-500">{activePage.topic}</span>
+                          <span className="text-slate-500">{topicByPage.get(activePage.id)}</span>
                         </>
                       )}
                    </div>
@@ -325,11 +648,11 @@ export default function App() {
                 
                 <button
                   onClick={handleDownloadAll}
-                  disabled={allQuestions.length === 0}
+                  disabled={allQuestions.length === 0 || !!exportProgress}
                   className="w-full bg-brand-600 hover:bg-brand-700 text-white font-black py-4 px-4 rounded-2xl flex items-center justify-center gap-3 transition-all disabled:opacity-20 shadow-xl shadow-brand-100 active:scale-[0.97] uppercase text-sm tracking-widest"
                 >
-                  <DownloadIcon className="w-5 h-5" />
-                  Export All (Auto-Named)
+                  {exportProgress ? <LoaderIcon className="w-5 h-5 animate-spin" /> : <DownloadIcon className="w-5 h-5" />}
+                  {exportProgress ? `Exporting ${exportProgress}` : 'Export All (Auto-Named)'}
                 </button>
               </div>
 
@@ -343,9 +666,9 @@ export default function App() {
                         </div>
                         <span className="text-xs font-black text-slate-800 uppercase tracking-widest">Page {page.pageNumber}</span>
                       </div>
-                      {page.topic && (
+                      {topicByPage.get(page.id) && (
                         <span className="text-[10px] text-slate-400 font-bold truncate mt-1 pl-9">
-                          {page.topic}
+                          {topicByPage.get(page.id)}
                         </span>
                       )}
                     </div>
@@ -367,12 +690,20 @@ export default function App() {
                               {region.testNumber ? `Test ${region.testNumber}` : ''}
                             </span>
                           </div>
-                          <button
-                            onClick={(e) => { e.stopPropagation(); handleDownloadCrop(region); }}
-                            className="text-slate-400 hover:text-brand-600 p-2 rounded-xl hover:bg-white transition-all"
-                          >
-                             <DownloadIcon className="w-5 h-5" />
-                          </button>
+                          <div className="flex items-center">
+                            <button
+                              onClick={(e) => { e.stopPropagation(); handleDownloadCrop(region, page.id); }}
+                              className="text-slate-400 hover:text-brand-600 p-2 rounded-xl hover:bg-white transition-all"
+                            >
+                               <DownloadIcon className="w-5 h-5" />
+                            </button>
+                            <button
+                              onClick={(e) => { e.stopPropagation(); handleDeleteRegion(region.id, page.id); }}
+                              className="text-slate-400 hover:text-red-600 p-2 rounded-xl hover:bg-white transition-all"
+                            >
+                               <TrashIcon className="w-5 h-5" />
+                            </button>
+                          </div>
                         </div>
                         
                         <div className="bg-white p-4">
