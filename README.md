@@ -53,7 +53,9 @@ is processing: browsers pause PDF page rendering in background tabs.
 ## Fixing crops by hand (web app)
 
 - **Boxes**: drag a box to move it, drag its handles to resize it, and use
-  **Add Box** to draw a missed question. A new box is numbered from where it
+  **Add Box** to draw a missed question. To drop a crop, use its trash icon
+  or select its box on the page and press Delete/Backspace (for example a
+  question whose shared passage is on the previous page). A new box is numbered from where it
   sits: a box drawn before Q2 becomes Q1 (when 1 is free), not "highest + 1".
 - **Question numbers**: click the `Q5 ✎` badge on a crop and type the right
   number (Enter to save, Esc to cancel). A number used twice on a page is
@@ -65,6 +67,8 @@ is processing: browsers pause PDF page rendering in background tabs.
   it or its handles to adjust it, or **Delete** it. A crop's
   **+ passage ✕** chip drops the passage from that one crop. Esc cancels
   drawing and closes the panel.
+- **Navigation**: picking a page on the left scrolls the crop list to that
+  page; clicking a box on the page scrolls to its crop.
 
 ## File names
 

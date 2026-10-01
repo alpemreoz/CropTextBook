@@ -63,14 +63,33 @@ export default function App() {
   // Drawing tools and the passage panel belong to the page they were used on.
   useEffect(() => { setTool('select'); setSelectedPassage(null); setDraftBox(null); }, [activePageId]);
 
+  // Esc cancels drawing and closes the passage panel; Delete/Backspace
+  // removes the selected crop (or the selected passage). Not while typing.
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
-      if (e.key !== 'Escape' || (e.target as HTMLElement)?.tagName === 'INPUT') return;
-      setTool('select'); setSelectedPassage(null); setDraftBox(null); dragRef.current = null;
+      if ((e.target as HTMLElement)?.tagName === 'INPUT') return;
+      if (e.key === 'Escape') {
+        setTool('select'); setSelectedPassage(null); setDraftBox(null); dragRef.current = null;
+      } else if ((e.key === 'Delete' || e.key === 'Backspace') && activePage) {
+        if (selectedPassage) { e.preventDefault(); deleteSelectedPassage(); return; }
+        const sel = activePage.regions.find(r => r.isSelected);
+        if (sel) { e.preventDefault(); handleDeleteRegion(sel.id, activePage.id); }
+      }
     };
     window.addEventListener('keydown', onKey);
     return () => window.removeEventListener('keydown', onKey);
-  }, []);
+  });
+
+  // The page strip on the left keeps the active page's thumbnail in view
+  // (it changes when a crop of another page is picked on the right).
+  useEffect(() => {
+    if (activePageId) document.getElementById(`thumb-${activePageId}`)?.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
+  }, [activePageId]);
+
+  /** Scrolls the crop list on the right to a page's section or one crop card. */
+  const revealInList = (id: string, block: ScrollLogicalPosition) =>
+    // After React has rendered the selection (a page's section may be new).
+    setTimeout(() => document.getElementById(id)?.scrollIntoView({ block, behavior: 'smooth' }), 0);
 
   // Redraw the canvas when the container is resized (or first laid out).
   useEffect(() => {
@@ -500,6 +519,7 @@ export default function App() {
     if (hit) {
       setSelectedPassage(null);
       if (!hit.isSelected) handleSelectRegion(hit.id, activePage.id);
+      revealInList(`crop-${hit.id}`, 'nearest');
       dragRef.current = { mode: 'move', regionId: hit.id, startNX: nx, startNY: ny, origBox: { ...hit.box } };
       return;
     }
@@ -709,7 +729,8 @@ export default function App() {
               {pages.map((p, idx) => (
                 <button 
                   key={p.id}
-                  onClick={() => setActivePageId(p.id)}
+                  id={`thumb-${p.id}`}
+                  onClick={() => { setActivePageId(p.id); revealInList(`page-section-${p.id}`, 'start'); }}
                   className={`w-14 h-14 rounded-2xl overflow-hidden border-4 transition-all relative flex-shrink-0
                     ${activePageId === p.id ? 'border-brand-500 scale-110 shadow-lg shadow-brand-500/20' : 'border-slate-700 hover:border-slate-500 opacity-60'}
                   `}
@@ -851,7 +872,7 @@ export default function App() {
                 )}
               <div className="flex-1 overflow-y-auto p-6 space-y-8 no-scrollbar">
                 {pages.map(page => (
-                  <div key={page.id} className="space-y-4">
+                  <div key={page.id} id={`page-section-${page.id}`} className="space-y-4 scroll-mt-2">
                     <div className="sticky top-0 z-10 bg-white/90 backdrop-blur py-2 flex flex-col border-b border-slate-100">
                       <div className="flex items-center gap-3">
                         <div className="w-6 h-6 bg-slate-800 text-white rounded-lg flex items-center justify-center text-[10px] font-black">
@@ -869,7 +890,8 @@ export default function App() {
                     {[...page.regions].sort((x, y) =>
                       (parseInt(x.questionNumber, 10) - parseInt(y.questionNumber, 10)) || readingOrder(x.box, y.box)).map((region) => (
                       <div 
-                        key={region.id} 
+                        key={region.id}
+                        id={`crop-${region.id}`}
                         className={`group relative border-2 rounded-2xl overflow-hidden transition-all duration-300
                           ${region.isSelected ? 'border-brand-500 shadow-xl shadow-brand-50/50 scale-[1.02]' : 'border-slate-100 hover:border-slate-300'}
                         `}
@@ -926,6 +948,7 @@ export default function App() {
                             </button>
                             <button
                               onClick={(e) => { e.stopPropagation(); handleDeleteRegion(region.id, page.id); }}
+                              title="Delete this crop (or select its box on the page and press Delete)"
                               className="text-slate-400 hover:text-red-600 p-2 rounded-xl hover:bg-white transition-all"
                             >
                                <TrashIcon className="w-5 h-5" />
