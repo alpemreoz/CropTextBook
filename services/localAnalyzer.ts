@@ -193,7 +193,14 @@ export const analyzeTestPageLocal = async (
     const labelHeights = marginLabels.flat().map(m => m.bbox.y1 - m.bbox.y0).sort((a, b) => a - b);
     const capH = labelHeights.length ? labelHeights[labelHeights.length >> 1] : H * 0.0105;
     await readShapeLetters(core.optionlessStrips({ map, layout, columnLines, marginLabels, extraOptionLines }), capH, extraOptionLines);
-    regions = core.findQuestions({ map, layout, columnLines, marginLabels, extraOptionLines });
+    // Text the column OCR skipped (shaded instruction boxes), read on its
+    // own; used only to find shared-passage instructions.
+    const passageLines: Line[][] = layout.columns.map(() => []);
+    for (const band of core.unreadBands(map, layout, columnLines)) {
+      const line = core.instructionFromBand(await ocrRegion(band.x0, band.y0, band.x1, band.y1, 2), band);
+      if (line) passageLines[band.col].push(line);
+    }
+    regions = core.findQuestions({ map, layout, columnLines, marginLabels, extraOptionLines, passageLines });
   }
 
   let testNumber: string | undefined = core.readTestNumber(headerLines);

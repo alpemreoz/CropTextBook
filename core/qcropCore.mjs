@@ -111,6 +111,38 @@ export const detectLayout = (map, labelBoxes = []) => {
   while (headerTop < H * 0.2 && map.rowInk[headerTop] <= noise) headerTop++;
   let headerBottom = findGap(map, headerTop, Math.floor(H * 0.25), noise, gapRows);
   if (headerBottom < 0) headerBottom = headerTop;
+  // A badge hanging below the header bar ("TEST 31" circle) can touch the
+  // first content row, leaving no blank row between them. Once a wide header
+  // row is passed, rows whose ink is one narrow cluster count as blank. That
+  // end is used when a question number would otherwise sit in the header
+  // (text layers), or, without label hints (OCR), when two-column content
+  // follows the badge inside the header band.
+  let wideSeen = false, blank = 0, narrowBottom = -1;
+  for (let y = headerTop; y < headerBottom; y++) {
+    let x0 = -1, x1 = -1;
+    for (let x = 0, row = y * W; x < W; x++) if (map.ink[row + x]) { if (x0 < 0) x0 = x; x1 = x; }
+    const narrow = x0 < 0 || x1 - x0 <= W * 0.12;
+    if (!narrow) { wideSeen = true; blank = 0; continue; }
+    if (wideSeen && ++blank >= gapRows) { narrowBottom = y; break; }
+  }
+  if (narrowBottom > 0) {
+    let swallowed;
+    if (labelBoxes.length) {
+      swallowed = labelBoxes.some(b => b.y0 > narrowBottom && b.y1 < headerBottom);
+    } else {
+      let bothSides = 0;
+      for (let y = narrowBottom; y < headerBottom; y++) {
+        let left = false, right = false;
+        for (let x = 0, row = y * W; x < W; x++) {
+          if (!map.ink[row + x]) continue;
+          if (x < W * 0.45) left = true; else if (x > W * 0.55) right = true;
+        }
+        if (left && right) bothSides++;
+      }
+      swallowed = headerBottom - narrowBottom > H * 0.03 && bothSides >= H * 0.005;
+    }
+    if (swallowed) headerBottom = narrowBottom;
+  }
 
   let footerBottom = H - 1;
   while (footerBottom > H * 0.85 && map.rowInk[footerBottom] <= noise) footerBottom--;
@@ -834,8 +866,10 @@ export const capHeightFromStrips = (strips, H, fromTextLayer) => {
  * `strictLabels` (PDF text layers) requires "N." exactly; OCR input also
  * accepts "N," since Tesseract often misreads the period. `pageLines` (all
  * text lines on the page, defaults to the columns') are scanned for section
- * headings. OCR input may add `marginLabels` (see labelStrips) and
- * `extraOptionLines[col]` (sparse re-reads of optionless strips).
+ * headings. OCR input may add `marginLabels` (see labelStrips),
+ * `extraOptionLines[col]` (sparse re-reads of optionless strips) and
+ * `passageLines[col]` (instructions read from unreadBands()). Questions that
+ * share a passage get a `contextBox` (see attachPassages).
  */
 export const findQuestions = (params) => {
   const { map, layout, columnLines, extraOptionLines } = params;
@@ -914,10 +948,191 @@ export const findQuestions = (params) => {
         ymax: scale1000(bounds.y1, H),
       },
       ...(mask && { mask }),
+      q: { col: q.col, y0: q.stripTop, y1: bounds.y1 },
     });
   }
-  return regions;
+  attachPassages(params, regions);
+  return regions.map(({ q, ...r }) => r);
 };
+
+// ---------------------------------------------------------------------------
+// Shared passages ("2. ve 3. soruları aşağıdaki metne göre cevaplayınız.")
+// ---------------------------------------------------------------------------
+
+// "2. ve 3.", "1. - 2.", "4 - 5.", "1 - 5.", "1, 2, 3, 4 ve 5." followed by
+// "soru...": the questions that share the passage. A dash is a range.
+const PASSAGE_NUMS_RE = /(\d{1,3})\s*[.,]?\s*((?:(?:ve|-|–|—|,)\s*\d{1,3}\s*[.,]?\s*)+)soru/i;
+const PASSAGE_VERB_RE = /cevapla|yanıtla|yanitla|çözünüz|cozunuz/i;
+
+const passageNumbers = (text) => {
+  const m = PASSAGE_NUMS_RE.exec(text);
+  if (!m) return null;
+  const nums = [parseInt(m[1], 10)];
+  for (const p of m[2].matchAll(/(ve|-|–|—|,)\s*(\d{1,3})/g)) {
+    const n = parseInt(p[2], 10), last = nums[nums.length - 1];
+    if (p[1] !== 've' && p[1] !== ',' && n > last && n - last <= 10) {
+      for (let k = last + 1; k <= n; k++) nums.push(k);
+    } else nums.push(n);
+  }
+  if (nums.length < 2 || nums.some((n, i) => i && n <= nums[i - 1])) return null;
+  return nums;
+};
+
+/**
+ * OCR pages: line-sized bands of ink inside a column that no OCR line
+ * covers. Tesseract can skip text set in a shaded box, which is where
+ * shared-passage instructions usually sit. Only wide bands (a line of text,
+ * not a figure fragment) are returned: [{ col, x0, y0, x1, y1 }].
+ */
+export const unreadBands = (map, layout, columnLines) => {
+  const W = map.width, H = map.height;
+  const out = [];
+  layout.columns.forEach((col, colIdx) => {
+    const covered = new Uint8Array(H);
+    for (const l of columnLines[colIdx]) {
+      for (let y = Math.max(0, Math.floor(l.bbox.y0)); y < Math.min(H, Math.ceil(l.bbox.y1)); y++) covered[y] = 1;
+    }
+    const rules = verticalRules(map, col.x0, layout.contentTop, col.x1 + 1, layout.contentBottom);
+    let start = -1, last = -1, minX = Infinity, maxX = -1;
+    const flush = () => {
+      const h = last - start + 1;
+      if (start >= 0 && h >= H * 0.006 && h <= H * 0.045 && maxX - minX > (col.x1 - col.x0) * 0.4) {
+        out.push({ col: colIdx, x0: col.x0, y0: Math.max(0, start - 4), x1: col.x1, y1: Math.min(H, last + 5) });
+      }
+      start = -1; minX = Infinity; maxX = -1;
+    };
+    for (let y = layout.contentTop; y < layout.contentBottom; y++) {
+      let x0 = -1, x1 = -1;
+      if (!covered[y]) {
+        for (let x = col.x0, row = y * W; x <= col.x1; x++) {
+          if (map.ink[row + x] && !rules.has(x)) { if (x0 < 0) x0 = x; x1 = x; }
+        }
+      }
+      if (x0 >= 0) {
+        if (start < 0) start = y;
+        last = y; minX = Math.min(minX, x0); maxX = Math.max(maxX, x1);
+      } else if (start >= 0 && y - last > 3) flush();
+    }
+    flush();
+  });
+  return out;
+};
+
+/**
+ * OCR lines read from one unreadBands() band -> a single instruction line
+ * when they name shared-passage questions, else null.
+ */
+export const instructionFromBand = (lines, band) => {
+  const text = lines.map(l => l.text.trim()).join(' ');
+  if (!passageNumbers(text) || !PASSAGE_VERB_RE.test(text)) return null;
+  return { text, bbox: { x0: band.x0, y0: band.y0, x1: band.x1, y1: band.y1 }, words: [] };
+};
+
+/**
+ * Instruction lines naming the questions that share a passage, and the
+ * passage itself: the content between the instruction and the first of
+ * those questions (down to the column's end when the questions start in the
+ * next column), or, when nothing sits there, the content above the
+ * instruction ("Yukarıdaki test özetini inceleyerek 6. ve 7. soruları
+ * cevaplandırınız."). Wording ("aşağıdaki"/"yukarıdaki") isn't trusted:
+ * books use both for either layout. Adds `contextBox` to those regions.
+ */
+const attachPassages = ({ map, layout, columnLines, passageLines }, regions) => {
+  if (!regions.length) return;
+  const W = map.width, H = map.height;
+  const pad = Math.round(H * 0.004);
+  columnLines.forEach((colLines, colIdx) => {
+    const lines = passageLines?.[colIdx]?.length
+      ? [...colLines, ...passageLines[colIdx]].sort((a, b) => a.bbox.y0 - b.bbox.y0)
+      : colLines;
+    const col = layout.columns[colIdx];
+    lines.forEach((line, li) => {
+      const nums = passageNumbers(line.text);
+      if (!nums) return;
+      const tail = line.text + ' ' + (lines[li + 1]?.text ?? '');
+      if (!PASSAGE_VERB_RE.test(tail)) return;
+      // The questions it names, after it in reading order.
+      const after = (r) => r.q.col > colIdx || (r.q.col === colIdx && r.q.y0 >= line.bbox.y0);
+      const targets = regions.filter(r => nums.includes(+r.questionNumber) && after(r));
+      if (!targets.length) return;
+      const first = [...targets].sort((a, b) => a.q.col - b.q.col || a.q.y0 - b.q.y0)[0];
+      // The instruction's own text may wrap onto the next line.
+      let instrBottom = line.bbox.y1;
+      const next = lines[li + 1];
+      if (next && !PASSAGE_VERB_RE.test(line.text) && PASSAGE_VERB_RE.test(next.text) &&
+        next.bbox.y0 - line.bbox.y1 < (line.bbox.y1 - line.bbox.y0) * 1.2) instrBottom = next.bbox.y1;
+      const x0 = col.x0, x1 = col.x1 + 1;
+      // Skip the rest of the instruction box: its sides (vertical rules
+      // beside the instruction text) don't count as ink, and a thin run
+      // right below the text is its bottom border.
+      const sides = verticalRules(map, x0, Math.round(line.bbox.y0), x1, Math.round(instrBottom), 0.9);
+      const rowInk = (yy) => {
+        for (let x = x0; x < x1; x++) if (map.ink[yy * W + x] && !sides.has(x)) return true;
+        return false;
+      };
+      let y = Math.round(instrBottom) + 1;
+      while (y < H && y < instrBottom + H * 0.004 && rowInk(y)) y++; // descenders
+      let blank = y;
+      while (blank < H && blank < y + H * 0.01 && !rowInk(blank)) blank++;
+      let run = blank;
+      while (run < H && rowInk(run)) run++;
+      if (run - blank <= H * 0.004 && blank < y + H * 0.01) y = run;
+      // Boxes whose sides don't line up with the text box are caught by
+      // their bottom edge instead: a long unbroken horizontal run (text
+      // never has one) just under the instruction with white space below
+      // it. (A figure starting right away, a grid, has more ink below.)
+      const longRun = (yy) => {
+        let best = 0, cur = 0;
+        for (let x = x0; x < x1; x++) { cur = map.ink[yy * W + x] ? cur + 1 : 0; if (cur > best) best = cur; }
+        return best > (x1 - x0) * 0.25;
+      };
+      const clearBelow = (yy) => {
+        for (let k = 1; k <= H * 0.004; k++) if (yy + k < H && rowInk(yy + k)) return false;
+        return true;
+      };
+      for (let yy = Math.round((line.bbox.y0 + instrBottom) / 2); yy < Math.min(H, instrBottom + H * 0.02); yy++) {
+        if (!longRun(yy)) continue;
+        let end = yy;
+        while (end + 1 < H && longRun(end + 1)) end++; // a border can be a few px thick
+        if (clearBelow(end) && end + 1 > y) y = end + 1;
+        yy = end;
+      }
+      // Passage below: up to the first question (same column) or column end.
+      // (Any other question further down this column also ends it.)
+      const below = first.q.col === colIdx ? first.q.y0 - pad : Math.min(layout.contentBottom,
+        ...regions.filter(r => r.q.col === colIdx && r.q.y0 > line.bbox.y1).map(r => r.q.y0 - pad));
+      const rules = verticalRules(map, col.x0, y, x1, Math.max(y + 1, below));
+      let bounds = below - y > H * 0.02 ? inkBounds(map, x0, y, x1, below, rules) : null;
+      if (!bounds || bounds.y1 - bounds.y0 < H * 0.02) {
+        // Passage above: from the end of the previous question in this
+        // column (or the column top) to the instruction.
+        const prevEnd = Math.max(layout.contentTop, ...regions
+          .filter(r => r.q.col === colIdx && r.q.y1 <= line.bbox.y0)
+          .map(r => r.q.y1 + pad));
+        const top = line.bbox.y0 - pad;
+        if (top - prevEnd < H * 0.02) return;
+        bounds = inkBounds(map, x0, prevEnd, x1, top, verticalRules(map, col.x0, prevEnd, x1, top));
+        if (!bounds || bounds.y1 - bounds.y0 < H * 0.02) return;
+      }
+      const contextBox = {
+        xmin: scale1000(bounds.x0, W), ymin: scale1000(bounds.y0, H),
+        xmax: scale1000(bounds.x1, W), ymax: scale1000(bounds.y1, H),
+      };
+      for (const r of targets) r.contextBox = contextBox;
+    });
+  });
+};
+
+/**
+ * Where the passage and the question go in a combined crop: passage on top,
+ * question below a small gap, both left-aligned. Sizes in pixels.
+ */
+export const stackLayout = (ctx, q, gap) => ({
+  width: Math.max(ctx.sw, q.sw),
+  height: ctx.sh + gap + q.sh,
+  ctxAt: { x: 0, y: 0 },
+  qAt: { x: 0, y: ctx.sh + gap },
+});
 
 // ---------------------------------------------------------------------------
 // Page metadata

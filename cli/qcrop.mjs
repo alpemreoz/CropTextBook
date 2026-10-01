@@ -321,7 +321,14 @@ const analyzePage = async (page) => {
     const capH = labelHeights.length ? labelHeights[labelHeights.length >> 1] : H * 0.0105;
     const still = core.optionlessStrips({ map, layout, columnLines, marginLabels, extraOptionLines });
     await readShapeLetters(still, capH, extraOptionLines);
-    regions = core.findQuestions({ map, layout, columnLines, marginLabels, extraOptionLines });
+    // Text the column OCR skipped (shaded instruction boxes), read on its
+    // own; used only to find shared-passage instructions.
+    const passageLines = layout.columns.map(() => []);
+    for (const band of core.unreadBands(map, layout, columnLines)) {
+      const line = core.instructionFromBand(await ocrRegion(band.x0, band.y0, band.x1, band.y1, 2), band);
+      if (line) passageLines[band.col].push(line);
+    }
+    regions = core.findQuestions({ map, layout, columnLines, marginLabels, extraOptionLines, passageLines });
   }
 
   let testNumber = core.readTestNumber(headerLines);
@@ -402,30 +409,38 @@ const encode = (img, outPath) => (png
  * resolution (vector text stays sharp at any dpi). Images: cut from the
  * original file, which is as sharp as the source allows.
  */
-const cropRegion = async (page, ow, oh, box, mask, outPath) => {
-  let W = ow, H = oh, input;
-  if (page.pdfPage) {
-    const k = dpi / ANALYSIS_DPI;
-    W = Math.round(ow * k); H = Math.round(oh * k);
-    const r = core.cropRect(box, W, H);
-    const { stdout } = await execFileP('pdftoppm', [
+const renderRect = async (page, r) => {
+  const img = page.pdfPage
+    ? sharp((await execFileP('pdftoppm', [
       '-f', String(page.pdfPage), '-l', String(page.pdfPage), '-r', String(dpi),
       '-x', String(r.sx), '-y', String(r.sy), '-W', String(r.sw), '-H', String(r.sh),
       '-png', '-singlefile', page.source,
-    ], { encoding: 'buffer', maxBuffer: 1 << 30 });
-    input = { img: sharp(stdout), r };
-  } else {
-    const r = core.cropRect(box, W, H);
-    input = { img: sharp(page.file).extract({ left: r.sx, top: r.sy, width: r.sw, height: r.sh }), r };
-  }
-  const flat = await input.img.flatten({ background: '#fff' }).toBuffer();
+    ], { encoding: 'buffer', maxBuffer: 1 << 30 })).stdout)
+    : sharp(page.file).extract({ left: r.sx, top: r.sy, width: r.sw, height: r.sh });
+  // Lossless in-between step (a JPEG source would otherwise be re-encoded twice).
+  return img.flatten({ background: '#fff' }).removeAlpha().png({ compressionLevel: 1 }).toBuffer();
+};
+
+/**
+ * One question's image. With a shared passage (`contextBox`), the passage
+ * goes on top and the question below it.
+ */
+const cropRegion = async (page, ow, oh, region, outPath) => {
+  const k = page.pdfPage ? dpi / ANALYSIS_DPI : 1;
+  const W = Math.round(ow * k), H = Math.round(oh * k);
+  const r = core.cropRect(region.box, W, H);
   // White out the question number when it falls inside the box.
-  const m = core.maskRect(mask, input.r, W, H);
-  const overlays = m ? [{
-    input: { create: { width: m.w, height: m.h, channels: 3, background: '#fff' } },
-    left: m.x, top: m.y,
-  }] : [];
-  await encode(sharp(flat).composite(overlays), outPath);
+  const m = core.maskRect(region.mask, r, W, H);
+  const white = (w, h) => ({ create: { width: w, height: h, channels: 3, background: '#fff' } });
+  let q = await renderRect(page, r);
+  if (m) q = await sharp(q).composite([{ input: white(m.w, m.h), left: m.x, top: m.y }]).png({ compressionLevel: 1 }).toBuffer();
+  if (!region.contextBox) return encode(sharp(q), outPath);
+  const c = core.cropRect(region.contextBox, W, H);
+  const at = core.stackLayout(c, r, Math.round(H * 0.012));
+  await encode(sharp(white(at.width, at.height)).composite([
+    { input: await renderRect(page, c), left: at.ctxAt.x, top: at.ctxAt.y },
+    { input: q, left: at.qAt.x, top: at.qAt.y },
+  ]), outPath);
 };
 
 // ---------------------------------------------------------------------------
@@ -481,7 +496,7 @@ for (let i = 0; i < pages.length; i++) {
     if (png) name = name.replace(/\.jpg$/, '.png');
     for (let k = 2; used.has(name); k++) name = name.replace(/(_\d+)?\.(jpg|png)$/, `_${k}.$2`);
     used.add(name);
-    cropJobs.push(() => cropRegion(pages[i], r.ow, r.oh, region.box, region.mask, path.join(outDir, name)));
+    cropJobs.push(() => cropRegion(pages[i], r.ow, r.oh, region, path.join(outDir, name)));
     total++;
   }
   if (r.regions.length > 0 || !pages[i].source) {
@@ -492,6 +507,8 @@ for (let i = 0; i < pages.length; i++) {
       r.fromText ? 'text layer' : 'OCR',
     ].filter(Boolean).join(', ');
     console.log(`  ${pages[i].name}: ${meta} -> ${r.regions.map(q => 'Q' + q.questionNumber).join(' ') || 'no test questions'}`);
+    const shared = r.regions.filter(q => q.contextBox);
+    if (shared.length) console.log(`    with shared passage: ${shared.map(q => 'Q' + q.questionNumber).join(' ')}`);
   }
 }
 let nextJob = 0;

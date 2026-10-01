@@ -39,6 +39,32 @@ is processing: browsers pause PDF page rendering in background tabs.
   heading such as "Yazılı Sınav". The number label is excluded.
 - Two-column layouts; a divider that ends where a full-width section starts
   is handled.
+- **Shared passages.** When an instruction names the questions that share a
+  text, table or figure ("2. ve 3. soruları aşağıdaki metne göre
+  cevaplayınız.", "4 - 5. soruları…", "1, 2, 3, 4 ve 5. soruları…",
+  "(7. ve 8. soruları … göre çözünüz)"), each of those questions is cropped
+  as passage + question: the passage on top, the question below it. The
+  passage is whatever sits between the instruction and the first named
+  question (to the end of the column when the questions start in the next
+  one). When nothing sits there, it's the block above the instruction.
+  Books say "aşağıdaki" or "yukarıdaki" for either layout, so the wording
+  isn't used. The instruction line itself is left out.
+
+## Fixing crops by hand (web app)
+
+- **Boxes**: drag a box to move it, drag its handles to resize it, and use
+  **Add Box** to draw a missed question. A new box is numbered from where it
+  sits: a box drawn before Q2 becomes Q1 (when 1 is free), not "highest + 1".
+- **Question numbers**: click the `Q5 ✎` badge on a crop and type the right
+  number (Enter to save, Esc to cancel). A number used twice on a page is
+  flagged, and the export adds `_2` so no file is overwritten.
+- **Shared passages**: detected passages show as purple boxes on the page.
+  **Add Passage** draws one by hand. The panel in the sidebar lists the
+  page's questions; tick the ones that use the passage (the first question
+  after it is ticked for you). Click a purple box to select it again, drag
+  it or its handles to adjust it, or **Delete** it. A crop's
+  **+ passage ✕** chip drops the passage from that one crop. Esc cancels
+  drawing and closes the panel.
 
 ## File names
 
