@@ -1155,6 +1155,30 @@ export const sanitizeName = (str) => str
   .replace(/_+/g, '_')
   .replace(/^_|_$/g, '');
 
+/**
+ * Pixel rectangle of a crop (0-1000 box plus a little padding) on a W×H
+ * page image. Padding is proportional, so the same box gives the same area
+ * at any render resolution.
+ */
+export const cropRect = (box, W, H) => {
+  const pX = W * 0.005, pY = H * 0.005, lP = W * 0.002;
+  const sx = Math.round(Math.max(0, (box.xmin / 1000) * W - lP));
+  const sy = Math.round(Math.max(0, (box.ymin / 1000) * H - pY));
+  const sw = Math.round(Math.min(W - sx, ((box.xmax - box.xmin) / 1000) * W + lP + pX));
+  const sh = Math.round(Math.min(H - sy, ((box.ymax - box.ymin) / 1000) * H + pY * 2));
+  return { sx, sy, sw, sh };
+};
+
+/** The mask (0-1000 page box) inside a crop rectangle, or null if outside. */
+export const maskRect = (mask, rect, W, H) => {
+  if (!mask) return null;
+  const x0 = Math.max(0, Math.round((mask.xmin / 1000) * W) - rect.sx);
+  const y0 = Math.max(0, Math.round((mask.ymin / 1000) * H) - rect.sy);
+  const x1 = Math.min(rect.sw, Math.round((mask.xmax / 1000) * W) - rect.sx);
+  const y1 = Math.min(rect.sh, Math.round((mask.ymax / 1000) * H) - rect.sy);
+  return x1 > x0 && y1 > y0 ? { x: x0, y: y0, w: x1 - x0, h: y1 - y0 } : null;
+};
+
 /** test04_kütle_merkezi_q1_33.jpg / karbohidratlar_q5_s104.jpg */
 export const cropFileName = ({ testNumber, topic, questionNumber, pageLabel }) => {
   const parts = [];

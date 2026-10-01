@@ -68,9 +68,17 @@ npm run cli -- ./scans -o ./crops
 ```
 
 PDF input needs poppler (`brew install poppler`) for rendering and the text
-layer. PDF pages are rendered at 300 dpi by default; `--dpi 400` (or any
-72–1200) makes crops sharper without changing what's detected. A 161-page
-text-layer PDF takes about 30 s.
+layer. Detection runs on a 300 dpi render; each crop is then rendered again
+from the PDF at 600 dpi, so text and vector drawings stay sharp. `--dpi 800`
+(or any 72–1200) changes the crop resolution without changing what's
+detected, and `--png` writes lossless PNGs instead of JPEGs (quality 95,
+no chroma subsampling). A 161-page text-layer PDF takes about 45 s.
+
+The web app works the same way: previews come from a smaller page render,
+and **Export** re-renders PDF crops at 600 dpi.
+
+Crops from page images can't be sharper than the images themselves. When
+exporting pages from Adobe, use 600 dpi.
 
 Page images (scans, or pages exported from a PDF) go through OCR, about
 0.7 s/page in the CLI and 5 s/page in the browser. Numbered files
@@ -79,7 +87,8 @@ so topics come from the unit covers as with a PDF. On images, question
 numbers are read a second time from each column's margin, and questions
 whose options sit beside drawings get two extra option passes (sparse-text
 OCR, then shape-based "A)" detection). When a PDF with real text exists,
-it's still the better input: exact, faster, and sharper crops.
+it's still the better input: exact, faster, and sharper crops (vector
+rendering instead of the image's fixed pixels).
 
 ## Legacy Gemini mode
 

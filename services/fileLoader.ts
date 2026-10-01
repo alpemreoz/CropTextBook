@@ -18,7 +18,14 @@ export interface PdfPageRef {
   source: string;
   pageIndex: number;
   load: () => Promise<{ dataUrl: string; textItems: PdfTextItem[] }>;
+  /** Page size in pixels at `dpi`. */
+  size: (dpi: number) => Promise<{ width: number; height: number }>;
+  /** Renders only the given pixel rectangle (at `dpi`) onto a new canvas. */
+  renderRegion: (dpi: number, rect: { sx: number; sy: number; sw: number; sh: number }) => Promise<HTMLCanvasElement>;
 }
+
+/** Resolution of exported PDF crops (the page preview is much smaller). */
+export const PDF_EXPORT_DPI = 600;
 
 export interface LoadedPage {
   /** Empty for PDF pages until `pdf.load()` runs. */
@@ -66,12 +73,37 @@ const expandPdf = async (file: File): Promise<LoadedPage[]> => {
     return { dataUrl: URL.createObjectURL(blob), textItems };
   };
 
+  const size = async (i: number, dpi: number) => {
+    const vp = (await doc.getPage(i)).getViewport({ scale: dpi / 72 });
+    return { width: Math.round(vp.width), height: Math.round(vp.height) };
+  };
+
+  // Vector text stays sharp at any scale, so crops are re-rendered from the
+  // PDF at export time instead of cut from the preview render.
+  const renderRegion = async (i: number, dpi: number, r: { sx: number; sy: number; sw: number; sh: number }) => {
+    const page = await doc.getPage(i);
+    const viewport = page.getViewport({ scale: dpi / 72 });
+    const canvas = document.createElement('canvas');
+    canvas.width = r.sw;
+    canvas.height = r.sh;
+    const ctx = canvas.getContext('2d')!;
+    ctx.fillStyle = '#fff';
+    ctx.fillRect(0, 0, r.sw, r.sh);
+    await page.render({ canvasContext: ctx, viewport, transform: [1, 0, 0, 1, -r.sx, -r.sy] }).promise;
+    page.cleanup();
+    return canvas;
+  };
+
   return Array.from({ length: doc.numPages }, (_, k) => ({
     dataUrl: '',
     // Named without a "page" keyword on purpose: the PDF page index is used
     // as-is (s<index>), never parsed back out of the filename.
     file: new File([], `${baseName} (p${k + 1}).jpg`, { type: 'image/jpeg' }),
-    pdf: { source: file.name, pageIndex: k + 1, load: () => load(k + 1) },
+    pdf: {
+      source: file.name, pageIndex: k + 1, load: () => load(k + 1),
+      size: (dpi: number) => size(k + 1, dpi),
+      renderRegion: (dpi: number, r: { sx: number; sy: number; sw: number; sh: number }) => renderRegion(k + 1, dpi, r),
+    },
   }));
 };
 

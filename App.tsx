@@ -1,8 +1,8 @@
 import React, { useState, useEffect, useRef, useCallback, useMemo } from 'react';
 import Uploader from './components/Uploader';
 import { analyzeTestPageLocal } from './services/localAnalyzer';
-import { expandFiles, LoadedPage } from './services/fileLoader';
-import { cropFileName, resolveTopics, imageSequence } from './core/qcropCore.mjs';
+import { expandFiles, LoadedPage, PDF_EXPORT_DPI } from './services/fileLoader';
+import { cropFileName, resolveTopics, imageSequence, cropRect, maskRect } from './core/qcropCore.mjs';
 import { QuestionRegion, AppStatus, BoundingBox, PageData } from './types';
 import { LoaderIcon, DownloadIcon, ScissorsIcon, TrashIcon, PlusIcon } from './components/Icons';
 
@@ -39,6 +39,7 @@ export default function App() {
   const [containerSize, setContainerSize] = useState({ w: 0, h: 0 });
   const [addMode, setAddMode] = useState(false);
   const [draftBox, setDraftBox] = useState<BoundingBox | null>(null);
+  const [exportProgress, setExportProgress] = useState<string | null>(null);
   const dragRef = useRef<DragState | null>(null);
 
   // Redraw the canvas when the container is resized (or first laid out).
@@ -302,30 +303,28 @@ export default function App() {
     if (!ctx) return '';
 
     const pX = img.width * 0.005, pY = img.height * 0.005;
-    const getC = (box: BoundingBox, isQ: boolean) => {
-      const lP = isQ ? img.width * 0.002 : pX; 
-      const sx = Math.max(0, (box.xmin / 1000) * img.width - lP);
+    const getC = (box: BoundingBox) => {
+      const sx = Math.max(0, (box.xmin / 1000) * img.width - pX);
       const sy = Math.max(0, (box.ymin / 1000) * img.height - pY);
-      const sw = Math.min(img.width - sx, ((box.xmax - box.xmin) / 1000) * img.width + (lP + pX));
+      const sw = Math.min(img.width - sx, ((box.xmax - box.xmin) / 1000) * img.width + pX * 2);
       const sh = Math.min(img.height - sy, ((box.ymax - box.ymin) / 1000) * img.height + pY * 2);
       return { sx, sy, sw, sh };
     };
 
-    const q = getC(qBox, true);
+    const q = cropRect(qBox, img.width, img.height);
     // White out the question number when it falls inside the box.
     const paintMask = (dx: number, dy: number) => {
-      if (!mask) return;
-      const mx0 = (mask.xmin / 1000) * img.width - q.sx, my0 = (mask.ymin / 1000) * img.height - q.sy;
-      const mx1 = (mask.xmax / 1000) * img.width - q.sx, my1 = (mask.ymax / 1000) * img.height - q.sy;
+      const m = maskRect(mask, q, img.width, img.height);
+      if (!m) return;
       ctx.fillStyle = '#fff';
-      ctx.fillRect(dx + Math.max(0, mx0), dy + Math.max(0, my0), Math.min(q.sw, mx1) - Math.max(0, mx0), Math.min(q.sh, my1) - Math.max(0, my0));
+      ctx.fillRect(dx + m.x, dy + m.y, m.w, m.h);
     };
     if (!cBox) {
       canvas.width = q.sw; canvas.height = q.sh; ctx.fillStyle = '#fff'; ctx.fillRect(0,0,q.sw,q.sh);
       ctx.drawImage(img, q.sx, q.sy, q.sw, q.sh, 0, 0, q.sw, q.sh);
       paintMask(0, 0);
     } else {
-      const c = getC(cBox, false); const gap = 40;
+      const c = getC(cBox); const gap = 40;
       canvas.width = Math.max(c.sw, q.sw); canvas.height = c.sh + gap + q.sh;
       ctx.fillStyle = '#fff'; ctx.fillRect(0,0,canvas.width,canvas.height);
       ctx.drawImage(img, c.sx, c.sy, c.sw, c.sh, (canvas.width-c.sw)/2, 0, c.sw, c.sh);
@@ -334,7 +333,7 @@ export default function App() {
       ctx.drawImage(img, q.sx, q.sy, q.sw, q.sh, (canvas.width-q.sw)/2, c.sh+gap, q.sw, q.sh);
       paintMask((canvas.width-q.sw)/2, c.sh+gap);
     }
-    return canvas.toDataURL('image/jpeg', 0.92);
+    return canvas.toDataURL('image/jpeg', 0.95);
   };
 
   // --- Manual region editing -------------------------------------------------
@@ -459,12 +458,43 @@ export default function App() {
     }
   };
 
-  const handleDownloadCrop = (region: QuestionRegion, pageId: string) => {
-    if (!region.croppedDataUrl) return;
+  /**
+   * The exported image. PDF crops are rendered again from the PDF at
+   * PDF_EXPORT_DPI (the on-screen preview comes from a smaller page render);
+   * image crops are already cut from the original file at full resolution.
+   */
+  const exportBlob = async (region: QuestionRegion, page: PageData): Promise<Blob | null> => {
+    if (page.pdf && !region.contextBox) {
+      try {
+        const { width, height } = await page.pdf.size(PDF_EXPORT_DPI);
+        const r = cropRect(region.box, width, height);
+        const canvas = await page.pdf.renderRegion(PDF_EXPORT_DPI, r);
+        const m = maskRect(region.mask, r, width, height);
+        if (m) {
+          const ctx = canvas.getContext('2d')!;
+          ctx.fillStyle = '#fff';
+          ctx.fillRect(m.x, m.y, m.w, m.h);
+        }
+        return await new Promise<Blob | null>(res => canvas.toBlob(res, 'image/jpeg', 0.95));
+      } catch (err) {
+        console.warn('High-res render failed; exporting the preview crop', err);
+      }
+    }
+    return region.croppedDataUrl ? (await fetch(region.croppedDataUrl)).blob() : null;
+  };
+
+  const saveBlob = (blob: Blob, name: string) => {
     const link = document.createElement('a');
-    link.href = region.croppedDataUrl;
-    link.download = cropFilename(region, pageId);
+    link.href = URL.createObjectURL(blob);
+    link.download = name;
     document.body.appendChild(link); link.click(); document.body.removeChild(link);
+    setTimeout(() => URL.revokeObjectURL(link.href), 1000);
+  };
+
+  const handleDownloadCrop = async (region: QuestionRegion, pageId: string) => {
+    const page = pages.find(p => p.id === pageId);
+    const blob = page && await exportBlob(region, page);
+    if (blob) saveBlob(blob, cropFilename(region, pageId));
   };
 
   const cropFilename = (region: QuestionRegion, pageId: string) => cropFileName({
@@ -475,21 +505,22 @@ export default function App() {
   });
 
   const handleDownloadAll = async () => {
+    if (exportProgress) return;
     const { default: JSZip } = await import('jszip');
     const zip = new JSZip();
-    pages.forEach(page => {
-      page.regions.forEach(region => {
-        if (region.croppedDataUrl) {
-          zip.file(cropFilename(region, page.id), region.croppedDataUrl.split(',')[1], { base64: true });
-        }
-      });
-    });
-    const blob = await zip.generateAsync({ type: 'blob' });
-    const link = document.createElement('a');
-    link.href = URL.createObjectURL(blob);
-    link.download = 'q-crop-export.zip';
-    document.body.appendChild(link); link.click(); document.body.removeChild(link);
-    URL.revokeObjectURL(link.href);
+    const jobs = pages.flatMap(page => page.regions.filter(r => r.croppedDataUrl).map(region => ({ page, region })));
+    try {
+      for (let i = 0; i < jobs.length; i++) {
+        setExportProgress(`${i + 1} / ${jobs.length}`);
+        const { page, region } = jobs[i];
+        const blob = await exportBlob(region, page);
+        if (blob) zip.file(cropFilename(region, page.id), blob);
+      }
+      setExportProgress('Zipping…');
+      saveBlob(await zip.generateAsync({ type: 'blob' }), 'q-crop-export.zip');
+    } finally {
+      setExportProgress(null);
+    }
   };
 
   const handleSelectRegion = (id: string, pId: string) => {
@@ -617,11 +648,11 @@ export default function App() {
                 
                 <button
                   onClick={handleDownloadAll}
-                  disabled={allQuestions.length === 0}
+                  disabled={allQuestions.length === 0 || !!exportProgress}
                   className="w-full bg-brand-600 hover:bg-brand-700 text-white font-black py-4 px-4 rounded-2xl flex items-center justify-center gap-3 transition-all disabled:opacity-20 shadow-xl shadow-brand-100 active:scale-[0.97] uppercase text-sm tracking-widest"
                 >
-                  <DownloadIcon className="w-5 h-5" />
-                  Export All (Auto-Named)
+                  {exportProgress ? <LoaderIcon className="w-5 h-5 animate-spin" /> : <DownloadIcon className="w-5 h-5" />}
+                  {exportProgress ? `Exporting ${exportProgress}` : 'Export All (Auto-Named)'}
                 </button>
               </div>
 

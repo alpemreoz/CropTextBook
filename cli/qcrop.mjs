@@ -1,11 +1,11 @@
 #!/usr/bin/env node
 // Q-Crop CLI: headless version of the web app.
 //
-//   node cli/qcrop.mjs <PDFs, images or folders...> [-o <output dir>]
+//   node cli/qcrop.mjs <PDFs, images or folders...> [-o <output dir>] [--dpi 600] [--png]
 //
-// Finds the multiple-choice questions on test-book pages and writes one JPEG
-// per question. Detection logic lives in core/qcropCore.mjs (shared with the
-// web app); this file supplies pixels (sharp) and text: a PDF's own text
+// Finds the multiple-choice questions on test-book pages and writes one image
+// per question (JPEG, or lossless PNG with --png). Detection logic lives in
+// core/qcropCore.mjs (shared with the web app); this file supplies pixels (sharp) and text: a PDF's own text
 // layer when it has one (exact and fast, via poppler), Tesseract OCR
 // otherwise. PDF input needs poppler's pdftoppm/pdftotext on PATH.
 
@@ -29,17 +29,21 @@ const PAGE_PARALLEL = 4;
 
 const args = process.argv.slice(2);
 let outDir = 'q-crop-out';
-// PDF pages are rendered at this resolution; it sets crop sharpness only
-// (detection always runs on a downscaled copy).
-let dpi = 300;
+// PDF pages are analyzed from a 300 dpi render (detection was tuned on it);
+// each crop is then rendered again from the PDF at the crop resolution, so
+// crops stay sharp without making every page render huge.
+const ANALYSIS_DPI = 300;
+let dpi = 600;
+let png = false;
 const inputs = [];
 for (let i = 0; i < args.length; i++) {
   if (args[i] === '-o' || args[i] === '--out') outDir = args[++i];
   else if (args[i] === '--dpi') dpi = parseInt(args[++i], 10);
+  else if (args[i] === '--png') png = true;
   else inputs.push(args[i]);
 }
 if (inputs.length === 0 || !(dpi >= 72 && dpi <= 1200)) {
-  console.error('Usage: node cli/qcrop.mjs <PDFs, images or folders...> [-o <output dir>] [--dpi <72-1200, default 300>]');
+  console.error('Usage: node cli/qcrop.mjs <PDFs, images or folders...> [-o <output dir>] [--dpi <72-1200, default 600>] [--png]');
   process.exit(1);
 }
 
@@ -99,7 +103,7 @@ const renderPdf = async (pdfPath, numPages, dir) => {
   for (let f = 1; f <= numPages; f += per) {
     const l = Math.min(numPages, f + per - 1);
     runs.push(execFileP('pdftoppm', [
-      '-f', String(f), '-l', String(l), '-r', String(dpi),
+      '-f', String(f), '-l', String(l), '-r', String(ANALYSIS_DPI),
       '-jpeg', '-jpegopt', 'quality=95', pdfPath, path.join(dir, 'p'),
     ]));
   }
@@ -384,34 +388,44 @@ const analyzePage = async (page) => {
 };
 
 // ---------------------------------------------------------------------------
-// Cropping (mirrors App.tsx cropImage padding)
+// Cropping (same geometry as App.tsx, via core.cropRect)
 // ---------------------------------------------------------------------------
 
-const cropRegion = async (file, ow, oh, box, mask, outPath) => {
-  const pX = ow * 0.005, pY = oh * 0.005, lP = ow * 0.002;
-  const sx = Math.round(Math.max(0, (box.xmin / 1000) * ow - lP));
-  const sy = Math.round(Math.max(0, (box.ymin / 1000) * oh - pY));
-  const sw = Math.round(Math.min(ow - sx, ((box.xmax - box.xmin) / 1000) * ow + lP + pX));
-  const sh = Math.round(Math.min(oh - sy, ((box.ymax - box.ymin) / 1000) * oh + pY * 2));
-  const overlays = [];
-  if (mask) {
-    // White out the question number when it falls inside the box.
-    const mx0 = Math.max(0, Math.round((mask.xmin / 1000) * ow) - sx);
-    const my0 = Math.max(0, Math.round((mask.ymin / 1000) * oh) - sy);
-    const mx1 = Math.min(sw, Math.round((mask.xmax / 1000) * ow) - sx);
-    const my1 = Math.min(sh, Math.round((mask.ymax / 1000) * oh) - sy);
-    if (mx1 > mx0 && my1 > my0) {
-      overlays.push({
-        input: { create: { width: mx1 - mx0, height: my1 - my0, channels: 3, background: '#fff' } },
-        left: mx0, top: my0,
-      });
-    }
+const encode = (img, outPath) => (png
+  ? img.png({ compressionLevel: 9 })
+  // 4:4:4 keeps colored figure lines crisp; 4:2:0 smears them.
+  : img.jpeg({ quality: 95, chromaSubsampling: '4:4:4' })
+).toFile(outPath);
+
+/**
+ * PDF pages: render just the crop area straight from the PDF at the crop
+ * resolution (vector text stays sharp at any dpi). Images: cut from the
+ * original file, which is as sharp as the source allows.
+ */
+const cropRegion = async (page, ow, oh, box, mask, outPath) => {
+  let W = ow, H = oh, input;
+  if (page.pdfPage) {
+    const k = dpi / ANALYSIS_DPI;
+    W = Math.round(ow * k); H = Math.round(oh * k);
+    const r = core.cropRect(box, W, H);
+    const { stdout } = await execFileP('pdftoppm', [
+      '-f', String(page.pdfPage), '-l', String(page.pdfPage), '-r', String(dpi),
+      '-x', String(r.sx), '-y', String(r.sy), '-W', String(r.sw), '-H', String(r.sh),
+      '-png', '-singlefile', page.source,
+    ], { encoding: 'buffer', maxBuffer: 1 << 30 });
+    input = { img: sharp(stdout), r };
+  } else {
+    const r = core.cropRect(box, W, H);
+    input = { img: sharp(page.file).extract({ left: r.sx, top: r.sy, width: r.sw, height: r.sh }), r };
   }
-  const cropped = await sharp(file)
-    .extract({ left: sx, top: sy, width: sw, height: sh })
-    .flatten({ background: '#fff' })
-    .toBuffer();
-  await sharp(cropped).composite(overlays).jpeg({ quality: 95 }).toFile(outPath);
+  const flat = await input.img.flatten({ background: '#fff' }).toBuffer();
+  // White out the question number when it falls inside the box.
+  const m = core.maskRect(mask, input.r, W, H);
+  const overlays = m ? [{
+    input: { create: { width: m.w, height: m.h, channels: 3, background: '#fff' } },
+    left: m.x, top: m.y,
+  }] : [];
+  await encode(sharp(flat).composite(overlays), outPath);
 };
 
 // ---------------------------------------------------------------------------
@@ -455,6 +469,7 @@ for (const idxs of bySource.values()) {
 
 let total = 0;
 const used = new Set();
+const cropJobs = [];
 for (let i = 0; i < pages.length; i++) {
   const r = results[i];
   if (!r) continue;
@@ -463,9 +478,10 @@ for (let i = 0; i < pages.length; i++) {
       testNumber: r.testNumber, topic: topics[i],
       questionNumber: region.questionNumber, pageLabel: r.pageLabel,
     });
-    for (let k = 2; used.has(name); k++) name = name.replace(/(_\d+)?\.jpg$/, `_${k}.jpg`);
+    if (png) name = name.replace(/\.jpg$/, '.png');
+    for (let k = 2; used.has(name); k++) name = name.replace(/(_\d+)?\.(jpg|png)$/, `_${k}.$2`);
     used.add(name);
-    await cropRegion(pages[i].file, r.ow, r.oh, region.box, region.mask, path.join(outDir, name));
+    cropJobs.push(() => cropRegion(pages[i], r.ow, r.oh, region.box, region.mask, path.join(outDir, name)));
     total++;
   }
   if (r.regions.length > 0 || !pages[i].source) {
@@ -478,6 +494,10 @@ for (let i = 0; i < pages.length; i++) {
     console.log(`  ${pages[i].name}: ${meta} -> ${r.regions.map(q => 'Q' + q.questionNumber).join(' ') || 'no test questions'}`);
   }
 }
+let nextJob = 0;
+await Promise.all(Array.from({ length: Math.max(2, os.cpus().length) }, async () => {
+  while (nextJob < cropJobs.length) await cropJobs[nextJob++]();
+}));
 
 console.log(`Done: ${total} crop(s) in ${((Date.now() - t0) / 1000).toFixed(1)}s -> ${outDir}/`);
 if (schedulerPromise) await (await schedulerPromise).terminate();
