@@ -19,6 +19,12 @@ export interface LocalAnalysis extends AnalysisResult {
   headerTopic?: string;
   /** Topic announced by a unit cover page, inherited by following pages. */
   coverTopic?: string;
+  /** Week from the header badge ("10. HAFTA" -> "10"), before resolveWeeks. */
+  week?: string;
+  /** A badge is there but its number may be misread (scans). */
+  weekUnsure?: boolean;
+  /** Digit shapes of the badge number, for reading it by shape (scans). */
+  weekGlyphs?: { aspect: number; bits: string }[];
   fromTextLayer: boolean;
 }
 
@@ -55,6 +61,8 @@ const getLabelWorker = makeWorker({ tessedit_char_whitelist: '0123456789.', tess
 const getSparseWorker = makeWorker({ tessedit_pageseg_mode: '11' });
 // Single option letters found by shape.
 const getLetterWorker = makeWorker({ tessedit_char_whitelist: 'ABCDE', tessedit_pageseg_mode: '10' });
+// The number of a header week badge ("10." of "10. HAFTA").
+const getWeekWorker = makeWorker({ tessedit_char_whitelist: '0123456789.', tessedit_pageseg_mode: '7' });
 
 /** Copy of `src` blurred at 1:1 scale. Canvas `filter: blur()` is applied to
  * the source *before* scaling, so blurring must happen in a separate pass
@@ -88,7 +96,8 @@ export const analyzeTestPageLocal = async (
   canvas.height = H;
   const ctx = canvas.getContext('2d', { willReadFrequently: true })!;
   ctx.drawImage(img, 0, 0, W, H);
-  const map = core.buildInkMap(ctx.getImageData(0, 0, W, H).data, W, H, 4);
+  const rgba = ctx.getImageData(0, 0, W, H).data;
+  const map = core.buildInkMap(rgba, W, H, 4);
 
   const fromText = core.textLayerUsable(textItems);
   const words: Word[] = fromText ? core.wordsFromTextItems(textItems, W, H) : [];
@@ -257,6 +266,31 @@ export const analyzeTestPageLocal = async (
 
   const section = core.readSection(headerLines);
   const headerTopic = core.readHeaderTopic(headerLines, W);
+
+  // Week badge ("10. HAFTA"): exact in a text layer; in scans read on its
+  // own (general OCR misses it), with the header OCR as a fallback.
+  let week: string | undefined = core.readWeek(headerLines);
+  let weekUnsure = false;
+  let weekGlyphs: { aspect: number; bits: string }[] | undefined;
+  if (!fromText) {
+    const badge = core.weekBadgeImage(rgba, W, H, 4, layout.contentTop);
+    weekUnsure = badge.found;
+    weekGlyphs = badge.glyphs;
+    if (badge.image) {
+      const { width, height, data } = badge.image;
+      const c = document.createElement('canvas');
+      c.width = width; c.height = height;
+      const bctx = c.getContext('2d')!;
+      const out = bctx.createImageData(width, height);
+      for (let i = 0; i < data.length; i++) {
+        out.data[i * 4] = out.data[i * 4 + 1] = out.data[i * 4 + 2] = data[i];
+        out.data[i * 4 + 3] = 255;
+      }
+      bctx.putImageData(out, 0, 0);
+      week = core.weekFromBadgeText((await (await getWeekWorker()).recognize(c)).data.text) ?? week;
+    }
+  }
+
   return {
     pageNumber: core.readPageNumber(footerLines, W) ?? 'unknown',
     testNumber,
@@ -264,6 +298,9 @@ export const analyzeTestPageLocal = async (
     section,
     headerTopic,
     coverTopic,
+    week,
+    weekUnsure,
+    weekGlyphs,
     regions,
     fromTextLayer: fromText,
   };

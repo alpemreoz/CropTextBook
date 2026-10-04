@@ -1,13 +1,14 @@
 #!/usr/bin/env node
 // Q-Crop CLI: headless version of the web app.
 //
-//   node cli/qcrop.mjs <PDFs, images or folders...> [-o <output dir>] [--dpi 600] [--png]
+//   node cli/qcrop.mjs <PDFs, images or folders...> [-o <output dir>] [--dpi 600] [--png] [--week]
 //
 // Finds the multiple-choice questions on test-book pages and writes one image
-// per question (JPEG, or lossless PNG with --png). Detection logic lives in
-// core/qcropCore.mjs (shared with the web app); this file supplies pixels (sharp) and text: a PDF's own text
-// layer when it has one (exact and fast, via poppler), Tesseract OCR
-// otherwise. PDF input needs poppler's pdftoppm/pdftotext on PATH.
+// per question (JPEG, or lossless PNG with --png; --week prefixes names with
+// the page's "N. HAFTA" week). Detection logic lives in core/qcropCore.mjs
+// (shared with the web app); this file supplies pixels (sharp) and text: a
+// PDF's own text layer when it has one (exact and fast, via poppler),
+// Tesseract OCR otherwise. PDF input needs poppler's pdftoppm/pdftotext on PATH.
 
 import sharp from 'sharp';
 import { createWorker, createScheduler } from 'tesseract.js';
@@ -35,15 +36,19 @@ let outDir = 'q-crop-out';
 const ANALYSIS_DPI = 300;
 let dpi = 600;
 let png = false;
+// Prefix crops with the page's week ("6_hafta_..."), for books whose answer
+// keys are listed by week.
+let week = false;
 const inputs = [];
 for (let i = 0; i < args.length; i++) {
   if (args[i] === '-o' || args[i] === '--out') outDir = args[++i];
   else if (args[i] === '--dpi') dpi = parseInt(args[++i], 10);
   else if (args[i] === '--png') png = true;
+  else if (args[i] === '--week') week = true;
   else inputs.push(args[i]);
 }
 if (inputs.length === 0 || !(dpi >= 72 && dpi <= 1200)) {
-  console.error('Usage: node cli/qcrop.mjs <PDFs, images or folders...> [-o <output dir>] [--dpi <72-1200, default 600>] [--png]');
+  console.error('Usage: node cli/qcrop.mjs <PDFs, images or folders...> [-o <output dir>] [--dpi <72-1200, default 600>] [--png] [--week]');
   process.exit(1);
 }
 
@@ -196,6 +201,7 @@ const makePool = (params, n) => {
 const getLabelPool = makePool({ tessedit_char_whitelist: '0123456789.', tessedit_pageseg_mode: '6' }, 2);
 const getSparsePool = makePool({ tessedit_pageseg_mode: '11' }, 2);
 const getLetterPool = makePool({ tessedit_char_whitelist: 'ABCDE', tessedit_pageseg_mode: '10' }, 2);
+const getWeekPool = makePool({ tessedit_char_whitelist: '0123456789.', tessedit_pageseg_mode: '7' }, 2);
 
 let digitWorkerPromise = null;
 const getDigitWorker = () => {
@@ -386,9 +392,24 @@ const analyzePage = async (page) => {
     pageLabel = pageNumber;
   }
 
+  // Week badge ("10. HAFTA"): exact in a text layer; in scans read on its
+  // own (general OCR misses it), with the header OCR as a fallback.
+  let pageWeek = core.readWeek(headerLines), weekUnsure = false, weekGlyphs;
+  if (week && !fromText) {
+    const badge = core.weekBadgeImage(gray, W, H, 1, layout.contentTop);
+    weekUnsure = badge.found;
+    weekGlyphs = badge.glyphs;
+    if (badge.image) {
+      const { width, height, data } = badge.image;
+      const png = await sharp(Buffer.from(data), { raw: { width, height, channels: 1 } }).png().toBuffer();
+      pageWeek = core.weekFromBadgeText((await (await getWeekPool()).addJob('recognize', png)).data.text) ?? pageWeek;
+    }
+  }
+
   return {
     regions, testNumber, pageNumber, pageLabel, ow, oh, fromText,
     section: core.readSection(headerLines),
+    week: pageWeek, weekUnsure, weekGlyphs,
     headerTopic: core.readHeaderTopic(headerLines, W),
     coverTopic,
   };
@@ -476,10 +497,14 @@ pages.forEach((p, i) => {
   if (!bySource.has(p.source)) bySource.set(p.source, []);
   bySource.get(p.source).push(i);
 });
+// Weeks likewise: one per cover-to-cover block, by majority (see resolveWeeks).
+const weeks = pages.map((p, i) => results[i]?.week);
 for (const idxs of bySource.values()) {
   idxs.sort((a, b) => pages[a].order - pages[b].order);
   const resolved = core.resolveTopics(idxs.map(i => results[i]));
   idxs.forEach((i, k) => { topics[i] = resolved[k]; });
+  const w = core.resolveWeeks(idxs.map(i => ({ ...results[i], isCover: !!results[i].coverTopic })));
+  idxs.forEach((i, k) => { weeks[i] = w[k]; });
 }
 
 let total = 0;
@@ -490,6 +515,7 @@ for (let i = 0; i < pages.length; i++) {
   if (!r) continue;
   for (const region of r.regions) {
     let name = core.cropFileName({
+      week: week ? weeks[i] : undefined,
       testNumber: r.testNumber, topic: topics[i],
       questionNumber: region.questionNumber, pageLabel: r.pageLabel,
     });
@@ -502,6 +528,7 @@ for (let i = 0; i < pages.length; i++) {
   if (r.regions.length > 0 || !pages[i].source) {
     const meta = [
       `page ${r.pageNumber}`,
+      weeks[i] && `week ${weeks[i]}`,
       r.testNumber && `test ${r.testNumber}`,
       topics[i] && `"${topics[i]}"`,
       r.fromText ? 'text layer' : 'OCR',

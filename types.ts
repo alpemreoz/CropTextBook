@@ -34,6 +34,9 @@ export interface PageData {
   topic?: string;
   coverTopic?: string; // set on unit cover pages; inherited by later pages of the same book
   section?: string;    // "TARAMA 1" style badge that names the page on its own
+  week?: string;       // header week badge as read ("10. HAFTA" -> "10"), see weekByPage
+  weekUnsure?: boolean;
+  weekGlyphs?: { aspect: number; bits: string }[]; // badge digit shapes (scans)
   pdf?: PdfPageRef;
   error?: string;
 }

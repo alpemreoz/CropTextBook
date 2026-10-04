@@ -2,7 +2,7 @@ import React, { useState, useEffect, useRef, useCallback, useMemo } from 'react'
 import Uploader from './components/Uploader';
 import { analyzeTestPageLocal } from './services/localAnalyzer';
 import { expandFiles, LoadedPage, PDF_EXPORT_DPI } from './services/fileLoader';
-import { cropFileName, resolveTopics, imageSequence, cropRect, maskRect, stackLayout } from './core/qcropCore.mjs';
+import { cropFileName, resolveTopics, resolveWeeks, imageSequence, cropRect, maskRect, stackLayout } from './core/qcropCore.mjs';
 import { QuestionRegion, AppStatus, BoundingBox, PageData } from './types';
 import { LoaderIcon, DownloadIcon, ScissorsIcon, TrashIcon, PlusIcon } from './components/Icons';
 
@@ -57,6 +57,14 @@ export default function App() {
   // The shared passage being edited (moved, resized, assigned to questions).
   const [selectedPassage, setSelectedPassage] = useState<BoundingBox | null>(null);
   const [editingNumberId, setEditingNumberId] = useState<string | null>(null);
+  // Prefix file names with the page's week ("6_hafta_..."), for books whose
+  // answer keys go by week. Off by default; remembered in this browser.
+  const [weekInNames, setWeekInNames] = useState<boolean>(() => {
+    try { return localStorage.getItem('qcrop.weekInNames') === '1'; } catch { return false; }
+  });
+  useEffect(() => {
+    try { localStorage.setItem('qcrop.weekInNames', weekInNames ? '1' : '0'); } catch { /* storage unavailable */ }
+  }, [weekInNames]);
   const [exportProgress, setExportProgress] = useState<string | null>(null);
   const dragRef = useRef<DragState | null>(null);
 
@@ -112,6 +120,27 @@ export default function App() {
   // inheritance from unit covers is derived from state rather than at
   // analysis time: within one PDF, in document order, a page without its own
   // topic takes the most recent cover's.
+  // Weeks per page: within a book, one per cover-to-cover block by majority
+  // (see resolveWeeks), so a stray or misread badge is outvoted.
+  const weekByPage = useMemo(() => {
+    const out = new Map<string, string | undefined>();
+    const byBook = new Map<string, { page: PageData; order: number }[]>();
+    for (const p of pages) {
+      const book = bookOf(p);
+      if (!book) { out.set(p.id, p.section ? undefined : p.week); continue; }
+      if (!byBook.has(book.key)) byBook.set(book.key, []);
+      byBook.get(book.key)!.push({ page: p, order: book.order });
+    }
+    for (const group of byBook.values()) {
+      group.sort((a, b) => a.order - b.order);
+      const resolved = resolveWeeks(group.map(({ page: p }) => ({
+        week: p.week, weekUnsure: p.weekUnsure, weekGlyphs: p.weekGlyphs, isCover: !!p.coverTopic, section: p.section,
+      })));
+      group.forEach(({ page }, i) => out.set(page.id, resolved[i]));
+    }
+    return out;
+  }, [pages]);
+
   const topicByPage = useMemo(() => {
     const out = new Map<string, string | undefined>();
     const byBook = new Map<string, { page: PageData; order: number }[]>();
@@ -243,6 +272,9 @@ export default function App() {
         topic,
         coverTopic: result.coverTopic,
         section: result.section,
+        week: result.week,
+        weekUnsure: result.weekUnsure,
+        weekGlyphs: result.weekGlyphs,
         regions: regionsWithData
       } : p));
     } catch (err: any) {
@@ -659,6 +691,7 @@ export default function App() {
   };
 
   const cropFilename = (region: QuestionRegion, pageId: string) => cropFileName({
+    week: weekInNames ? weekByPage.get(pageId) : undefined,
     testNumber: region.testNumber,
     topic: topicByPage.get(pageId) ?? region.topic,
     questionNumber: region.questionNumber,
@@ -796,6 +829,12 @@ export default function App() {
                 <div className="h-14 flex flex-col items-center justify-center">
                    <div className="flex items-center gap-4 text-slate-400 font-black text-[10px] uppercase tracking-[0.2em]">
                       <span>Page {activePage?.pageNumber || '...'}</span>
+                      {activePage && weekByPage.get(activePage.id) && (
+                        <>
+                          <span className="w-1 h-1 bg-slate-300 rounded-full"></span>
+                          <span className="text-brand-600">{weekByPage.get(activePage.id)}. Hafta</span>
+                        </>
+                      )}
                       {activePage?.testNumber && (
                         <>
                           <span className="w-1 h-1 bg-slate-300 rounded-full"></span>
@@ -823,6 +862,17 @@ export default function App() {
                     {allQuestions.length} TOTAL
                   </span>
                 </div>
+
+                <label
+                  className="flex items-center gap-3 mb-4 cursor-pointer select-none"
+                  title="For books whose answer key is listed by week: crops of week pages start with the week, e.g. 6_hafta_aktif_taşıma_q5_s104.jpg. Review sections keep their names."
+                >
+                  <input type="checkbox" className="w-4 h-4 accent-brand-600" checked={weekInNames}
+                    onChange={e => setWeekInNames(e.target.checked)} />
+                  <span className="text-xs font-bold text-slate-600">
+                    Add week to file names <span className="text-slate-400 font-semibold">(6_hafta_…)</span>
+                  </span>
+                </label>
                 
                 <button
                   onClick={handleDownloadAll}
@@ -879,6 +929,11 @@ export default function App() {
                           {page.pageNumber}
                         </div>
                         <span className="text-xs font-black text-slate-800 uppercase tracking-widest">Page {page.pageNumber}</span>
+                        {weekByPage.get(page.id) && (
+                          <span className="text-[10px] font-black text-brand-700 bg-brand-50 px-2 py-0.5 rounded-md uppercase tracking-wider">
+                            {weekByPage.get(page.id)}. Hafta
+                          </span>
+                        )}
                       </div>
                       {topicByPage.get(page.id) && (
                         <span className="text-[10px] text-slate-400 font-bold truncate mt-1 pl-9">
