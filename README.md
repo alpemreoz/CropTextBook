@@ -82,6 +82,16 @@ is processing: browsers pause PDF page rendering in background tabs.
   page (the line above the "Adı :" student form); review sections name
   themselves (`tarama_1`).
 - **Test**: the corner "TEST 04" badge, when the book has one.
+- **Week** (opt-in): for books whose answer key is listed by week, crops of
+  week pages can start with the header's "N. HAFTA" badge:
+  `6_hafta_aktif_taşıma_q5_s104.jpg`. Turn it on with **Add week to file
+  names** in the web app (remembered in the browser) or `--week` in the CLI.
+  Review sections (Tarama, Ara Tatil, Yarıyıl Tatili) keep their names. Pages
+  from one cover to the next are one week, so a stray or misread badge is
+  outvoted by the rest of its week. In scans the badge (light text on a dark
+  box) gets its own digits-only read, and digits OCR misses are matched
+  against digit shapes learned from badges it did read. A whole book always
+  resolves; with only a few scanned pages loaded, a week can stay blank.
 
 Example: `aktif_taşıma_endositoz_ekzositoz_q5_s104.jpg`.
 
@@ -101,7 +111,8 @@ PDF input needs poppler (`brew install poppler`) for rendering and the text
 layer. Detection runs on a 300 dpi render; each crop is then rendered again
 from the PDF at 600 dpi, so text and vector drawings stay sharp. `--dpi 800`
 (or any 72–1200) changes the crop resolution without changing what's
-detected, and `--png` writes lossless PNGs instead of JPEGs (quality 95,
+detected, `--week` prefixes crop names with the page's week (see File
+names), and `--png` writes lossless PNGs instead of JPEGs (quality 95,
 no chroma subsampling). A 161-page text-layer PDF takes about 45 s.
 
 The web app works the same way: previews come from a smaller page render,

@@ -1210,6 +1210,232 @@ export const readSection = (headerLines) => {
   return undefined;
 };
 
+/**
+ * The week badge in a page header ("6. HAFTA", "14.HAFTA") -> "6". Only the
+ * header counts: unit covers carry a stray hidden "1. HAFTA" mid-page.
+ * Review pages (TARAMA, ARA TATİL, YARIYIL TATİLİ) have none.
+ */
+export const readWeek = (headerLines) => {
+  for (const line of headerLines) {
+    const m = /(\d{1,2})\s*[.,]?\s*HAFTA/i.exec(line.text);
+    if (m && +m[1] > 0) return String(parseInt(m[1], 10));
+  }
+  return undefined;
+};
+
+/**
+ * OCR pages: the header's week badge (light "10. HAFTA" in a dark box at the
+ * right) as a clean black-on-white image of just its number, for a
+ * digits-only read; general OCR misses most of these (light text on colour,
+ * a heavy display font). `pixels` is the page at analysis size (1 or 4
+ * channels); the badge is looked for above `bandBottom` (the header's end).
+ * Returns { found, image, glyphs } — `found` when a badge box is there at all
+ * (its number may still be unreadable), `image` = { width, height, data } or
+ * null, `glyphs` the number's digit shapes (see GLYPH_W) for resolveWeeks.
+ */
+export const weekBadgeImage = (pixels, W, H, channels, bandBottom) => {
+  const band = Math.round(Math.min(H * 0.12, Math.max(bandBottom, H * 0.05)));
+  const lum = channels === 1
+    ? (x, y) => pixels[y * W + x]
+    : (x, y) => { const i = (y * W + x) * channels; return 0.299 * pixels[i] + 0.587 * pixels[i + 1] + 0.114 * pixels[i + 2]; };
+  // The box: the widest run of mostly dark columns in the right half.
+  const dark = (x, y) => lum(x, y) < 110;
+  let bx0 = -1, bx1 = -1, start = -1;
+  for (let x = Math.round(W * 0.5); x <= W; x++) {
+    let n = 0;
+    if (x < W) for (let y = 0; y < band; y++) if (dark(x, y)) n++;
+    const on = x < W && n >= band * 0.3;
+    if (on && start < 0) start = x;
+    if (!on && start >= 0) { if (x - start > bx1 - bx0) { bx0 = start; bx1 = x; } start = -1; }
+  }
+  if (bx1 - bx0 < W * 0.03) return { found: false, image: null, glyphs: [] };
+  let y0 = band, y1 = -1;
+  for (let y = 0; y < band; y++) {
+    let n = 0;
+    for (let x = bx0; x < bx1; x++) if (dark(x, y)) n++;
+    if (n >= (bx1 - bx0) * 0.5) { if (y < y0) y0 = y; y1 = y; }
+  }
+  if (y1 - y0 < H * 0.01) return { found: false, image: null, glyphs: [] };
+  // Inside the box (its edge blends with the background): light text.
+  const inset = Math.round((y1 - y0) * 0.12);
+  const x0 = bx0 + inset, x1 = bx1 - inset, iy0 = y0 + inset, iy1 = y1 - inset;
+  const lit = (x, y) => lum(x, y) > 170;
+  const cols = [];
+  let ty0 = iy1, ty1 = iy0;
+  for (let x = x0; x < x1; x++) {
+    let n = 0;
+    for (let y = iy0; y < iy1; y++) if (lit(x, y)) { n++; if (y < ty0) ty0 = y; if (y > ty1) ty1 = y; }
+    cols.push(n);
+  }
+  const first = cols.findIndex(n => n > 0);
+  let last = cols.length - 1;
+  while (last > 0 && cols[last] === 0) last--;
+  if (first < 0 || ty1 <= ty0) return { found: true, image: null, glyphs: [] };
+  // The number ends at the widest blank run: the space before "HAFTA".
+  let gap = [0, 0];
+  for (let i = first, run = 0; i <= last; i++) {
+    if (cols[i] === 0) { run++; if (run > gap[1] - gap[0]) gap = [i - run + 1, i + 1]; } else run = 0;
+  }
+  const th = ty1 - ty0;
+  // "32." is about two text heights wide; a word ("TARAMA") is far wider.
+  if (gap[1] <= gap[0] || gap[0] - first > th * 3) return { found: true, image: null, glyphs: [] };
+  const pad = Math.round(th * 0.3);
+  const sx = x0 + first - pad, sy = ty0 - pad, sw = gap[0] - first + pad * 2, sh = th + pad * 2;
+  // 4x upscale (bilinear), then text black on white with a white border.
+  const S = 4, border = 30;
+  const width = sw * S + border * 2, height = sh * S + border * 2;
+  const data = new Uint8Array(width * height).fill(255);
+  const at = (x, y) => (x < 0 || y < 0 || x >= W || y >= H ? 0 : lum(x, y));
+  for (let oy = 0; oy < sh * S; oy++) {
+    const fy = sy + (oy + 0.5) / S - 0.5, ya = Math.floor(fy), wy = fy - ya;
+    for (let ox = 0; ox < sw * S; ox++) {
+      const fx = sx + (ox + 0.5) / S - 0.5, xa = Math.floor(fx), wx = fx - xa;
+      const v = (at(xa, ya) * (1 - wx) + at(xa + 1, ya) * wx) * (1 - wy) + (at(xa, ya + 1) * (1 - wx) + at(xa + 1, ya + 1) * wx) * wy;
+      if (v > 170) data[(oy + border) * width + ox + border] = 0;
+    }
+  }
+  // Digit shapes: connected light areas of the number taller than half the
+  // text (the period is a separate, shorter one), left to right. Digits
+  // that touch stay one shape and simply don't match later.
+  const glyphs = [];
+  const gx0 = x0 + first, gx1 = x0 + gap[0], gw = gx1 - gx0, gh = ty1 - ty0 + 1;
+  const seen = new Uint8Array(gw * gh);
+  const stack = [];
+  for (let sy = 0; sy < gh; sy++) {
+    for (let sx = 0; sx < gw; sx++) {
+      if (seen[sy * gw + sx] || !lit(gx0 + sx, ty0 + sy)) continue;
+      let cx0 = sx, cx1 = sx, cy0 = sy, cy1 = sy;
+      seen[sy * gw + sx] = 1; stack.push(sy * gw + sx);
+      while (stack.length) {
+        const i = stack.pop(), x = i % gw, y = (i - x) / gw;
+        if (x < cx0) cx0 = x; if (x > cx1) cx1 = x; if (y < cy0) cy0 = y; if (y > cy1) cy1 = y;
+        for (const [nx, ny] of [[x + 1, y], [x - 1, y], [x, y + 1], [x, y - 1]]) {
+          if (nx < 0 || ny < 0 || nx >= gw || ny >= gh || seen[ny * gw + nx] || !lit(gx0 + nx, ty0 + ny)) continue;
+          seen[ny * gw + nx] = 1; stack.push(ny * gw + nx);
+        }
+      }
+      if (cy1 - cy0 >= th * 0.6) glyphs.push({ x: cx0, shape: glyphShape(lit, gx0 + cx0, ty0 + cy0, gx0 + cx1, ty0 + cy1) });
+    }
+  }
+  glyphs.sort((a, b) => a.x - b.x);
+  return { found: true, image: { width, height, data }, glyphs: glyphs.map(g => g.shape) };
+};
+
+const GLYPH_W = 10, GLYPH_H = 14;
+/** A glyph as { aspect, bits } (lit samples on a GLYPH_W x GLYPH_H grid). */
+const glyphShape = (lit, gx0, gy0, gx1, gy1) => {
+  let bits = '';
+  for (let gy = 0; gy < GLYPH_H; gy++) {
+    for (let gx = 0; gx < GLYPH_W; gx++) {
+      const x = Math.round(gx0 + (gx + 0.5) * (gx1 - gx0 + 1) / GLYPH_W - 0.5);
+      const y = Math.round(gy0 + (gy + 0.5) * (gy1 - gy0 + 1) / GLYPH_H - 0.5);
+      bits += lit(x, y) ? '1' : '0';
+    }
+  }
+  return { aspect: (gx1 - gx0 + 1) / (gy1 - gy0 + 1), bits };
+};
+
+const glyphDistance = (a, b) => {
+  let d = 0;
+  for (let i = 0; i < a.bits.length; i++) if (a.bits[i] !== b.bits[i]) d++;
+  return d / a.bits.length + Math.abs(a.aspect - b.aspect);
+};
+
+/**
+ * Week numbers the OCR missed, read by shape: digit shapes from badges whose
+ * number was read (one shape per digit) become this book's templates, and an
+ * unread badge whose digits all match a template closely is read with them.
+ * pages: [{ week, weekGlyphs }] -> [week | undefined] (only new reads).
+ */
+export const readWeeksByShape = (pages) => {
+  let templates = [];
+  for (const p of pages) {
+    if (!p.week || !p.weekGlyphs || p.weekGlyphs.length !== p.week.length) continue;
+    [...p.week].forEach((d, i) => templates.push({ d, g: p.weekGlyphs[i] }));
+  }
+  // A digit's odd one out (its period touched it in a blurry scan) is no
+  // template: it must look like most others of that digit.
+  templates = templates.filter((t, i) => {
+    const same = templates.filter((u, j) => j !== i && u.d === t.d).map(u => glyphDistance(t.g, u.g)).sort((a, b) => a - b);
+    return same.length < 2 || same[same.length >> 1] <= 0.3;
+  });
+  return pages.map(p => {
+    if (p.week || !p.weekGlyphs?.length || !templates.length) return undefined;
+    let out = '';
+    for (const g of p.weekGlyphs) {
+      // Nearest template per digit; the winner must be close and clear.
+      const byDigit = new Map();
+      for (const t of templates) {
+        const d = glyphDistance(g, t.g);
+        if (d < (byDigit.get(t.d) ?? Infinity)) byDigit.set(t.d, d);
+      }
+      const [best, second] = [...byDigit.entries()].sort((a, b) => a[1] - b[1]);
+      if (!best || best[1] > 0.12 || (second && second[1] < best[1] + 0.04)) return undefined;
+      out += best[0];
+    }
+    return +out >= 1 && +out <= 60 ? String(+out) : undefined;
+  });
+};
+
+/** Digits read from weekBadgeImage() -> week number string, or undefined. */
+export const weekFromBadgeText = (text) => {
+  const m = /^\s*(\d{1,2})\s*\.?\s*$/.exec(text ?? '');
+  return m && +m[1] >= 1 && +m[1] <= 60 ? String(+m[1]) : undefined;
+};
+
+/**
+ * Weeks for the pages of one book, in page order. Every week starts with a
+ * cover page, so pages from one cover to the next are one week: its number
+ * is the majority of what the pages read (a stray "21. HAFTA" or an OCR
+ * slip is outvoted). A block with no usable read between weeks w and w + 2
+ * is w + 1; a review block sits between w and w + 1 and stays unnumbered.
+ * Pages whose read is reliably absent (`weekUnsure` false: a text layer, or
+ * no badge in a scan) never get one; section pages (TARAMA) neither.
+ * Badges the OCR couldn't read are first read by shape (readWeeksByShape).
+ * pages: [{ week, weekUnsure, weekGlyphs, isCover, section }] -> [week | undefined]
+ */
+export const resolveWeeks = (pages) => {
+  const byShape = readWeeksByShape(pages);
+  pages = pages.map((p, i) => (byShape[i] ? { ...p, week: byShape[i] } : p));
+  const runs = [];
+  let cur = null;
+  pages.forEach((p, i) => {
+    if (p.section) { cur = null; return; }
+    if (p.isCover || !cur) { cur = { idx: [] }; runs.push(cur); }
+    cur.idx.push(i);
+  });
+  for (const run of runs) {
+    const counts = new Map();
+    for (const i of run.idx) if (pages[i].week) counts.set(pages[i].week, (counts.get(pages[i].week) ?? 0) + 1);
+    run.cands = [...counts.entries()].sort((a, b) => b[1] - a[1]);
+  }
+  // Majority first; a tie goes to the week that continues the previous one.
+  let prev;
+  for (const run of runs) {
+    const [best, second] = run.cands;
+    if (best) {
+      const tied = run.cands.filter(c => c[1] === best[1]).map(c => c[0]);
+      run.week = second && second[1] === best[1] && prev && tied.includes(String(+prev + 1)) ? String(+prev + 1) : best[0];
+      run.votes = best[1];
+      prev = run.week;
+    }
+  }
+  // A block between weeks w and w + 2 is w + 1, whatever it read: no read,
+  // or a misread ("5" for 15) that several of its pages agree on.
+  const voted = runs.map(r => r.week);
+  runs.forEach((run, k) => {
+    const before = voted.slice(0, k).reverse().find(Boolean);
+    const after = voted.slice(k + 1).find(Boolean);
+    if (before && after && +after - +before === 2) run.week = String(+before + 1);
+  });
+  const out = new Array(pages.length).fill(undefined);
+  for (const run of runs) {
+    if (!run.week) continue;
+    for (const i of run.idx) if (pages[i].week || pages[i].weekUnsure) out[i] = run.week;
+  }
+  return out;
+};
+
 const upperTr = (s) => s.toLocaleUpperCase('tr');
 // Whole words only: "SINIF" is boilerplate, "SINIFLANDIRMA" is a topic.
 const BOILERPLATE = new Set(['SINIF', 'KİTABI', 'KİTAP', 'İZLEME', 'HAFTA', 'TARAMA', 'ÜNİTE', 'UNİTE', 'TEST']);
@@ -1394,9 +1620,13 @@ export const maskRect = (mask, rect, W, H) => {
   return x1 > x0 && y1 > y0 ? { x: x0, y: y0, w: x1 - x0, h: y1 - y0 } : null;
 };
 
-/** test04_kütle_merkezi_q1_33.jpg / karbohidratlar_q5_s104.jpg */
-export const cropFileName = ({ testNumber, topic, questionNumber, pageLabel }) => {
+/**
+ * test04_kütle_merkezi_q1_33.jpg / karbohidratlar_q5_s104.jpg; with `week`
+ * (opt-in, for books whose answer keys go by week): 6_hafta_karbohidratlar_q5_s104.jpg
+ */
+export const cropFileName = ({ week, testNumber, topic, questionNumber, pageLabel }) => {
   const parts = [];
+  if (week) parts.push(`${week}*hafta`);
   if (testNumber) parts.push(`test${sanitizeName(testNumber)}`);
   if (topic) parts.push(sanitizeName(topic));
   parts.push(`q${questionNumber}`);
