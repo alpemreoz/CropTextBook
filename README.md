@@ -131,6 +131,66 @@ OCR, then shape-based "A)" detection). When a PDF with real text exists,
 it's still the better input: exact, faster, and sharper crops (vector
 rendering instead of the image's fixed pixels).
 
+## Book profiles (scanned question banks)
+
+Some books need settings the default analysis doesn't use: scanned question
+banks with no header banner on half their pages, spine text in the margin,
+one-line questions, numbering that restarts on learning pages, answers
+printed on the page. A **profile** turns those settings on for one book
+series; without a profile everything works exactly as before.
+
+```bash
+npm run cli -- ./book.pdf -o ./crops --profile apotemi
+```
+
+In the web app, pick the profile in the header (**Book profile**). Changing
+it analyzes the loaded pages again.
+
+| Profile | Book |
+| --- | --- |
+| `bilgisarmal` | Bilgi Sarmal – TYT Matematik Soru Bankası |
+| `orijinal` | Orijinal Yayınları – TYT Matematik Soru Bankası |
+| `acil` | Acil Yayınları – TYT Matematik Kurs Soru Bankası |
+| `ucdortbes-start` | ÜçDörtBeş – 0'dan Başla START Matematik |
+| `ucdortbes` | ÜçDörtBeş – TYT Matematik Soru Bankası |
+| `3d` | 3D Yayınları – TYT Matematik Soru Bankası |
+| `apotemi` | Apotemi – TYT Matematik Soru Bankası |
+
+What a profile can switch on (see `core/profiles.mjs`, where each profile
+lists only what differs from the defaults):
+
+- `headerFromLabels`: question numbers read from the column margins from
+  the top of the page decide where content starts (pages whose first
+  question sits where a header would be).
+- `trimEdgeText`: a thin band of ink along the page edge (vertical spine
+  text, scan borders) isn't part of a column.
+- `footerZone`: a footer starts in the bottom part of the page; a lower
+  "footer" is the page's last questions.
+- `leftmostGutter`: without a visible divider, the gutter is the leftmost
+  blank run (books with a logo in the gutter).
+- `answerSheetGuard: false`: keep one-line questions whose options start
+  right under the number.
+- `numberingRestarts`: numbering may start over on a page (1, 2, 3 under
+  each sub-heading of a learning page).
+- `namesPerTest`, `topicIgnore`: a test's number and topic, read on any of
+  its pages, name all its crops; banner text on the ignore list is never a
+  topic.
+- `answerKey`: the answers printed on the page (`bottom` strip, or `top`
+  for books printing them under the test title) are read for
+  **answers.csv** and the **self-check**.
+
+### answers.csv and the self-check
+
+With an answer-key profile the CLI writes `answers.csv` (file, page,
+question, answer) and `check.txt` next to the crops, and prints a one-line
+summary. The self-check groups the book into tests (numbering starts over
+in each) and compares each test's crops with its printed answers:
+questions printed but not cropped, and crops beyond the printed answers.
+In the web app each crop shows its answer, pages of a test with missing
+questions say so, and the ZIP export includes `answers.csv`. Printed
+answers are read by OCR too, so a "not cropped" now and then is a missed
+answer read rather than a missed question.
+
 ## Legacy Gemini mode
 
 `services/geminiService.ts` still contains the original Gemini-based analyzer

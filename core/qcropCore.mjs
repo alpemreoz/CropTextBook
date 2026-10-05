@@ -102,7 +102,7 @@ const findDivider = (map, lo, hi, y0, y1) => {
  * `labelBoxes` (question-number label boxes, when a PDF text layer gives
  * them exactly) corrects a split that landed inside the right column.
  */
-export const detectLayout = (map, labelBoxes = []) => {
+export const detectLayout = (map, labelBoxes = [], opts = {}) => {
   const { width: W, height: H } = map;
   const noise = Math.max(2, W * 0.001);
   const gapRows = Math.max(6, Math.round(H * 0.004));
@@ -153,19 +153,63 @@ export const detectLayout = (map, labelBoxes = []) => {
     else run = 0;
   }
 
+  // Profiles with `footerZone`: a footer starts in the bottom part of the
+  // page; a "footer" reaching higher is the last block of questions on a
+  // page without one (page number on a side tab).
+  if (opts.footerZone && footerTop < H * opts.footerZone) footerTop = footerBottom + 1;
+
   const contentTop = headerBottom;
   const contentBottom = Math.min(footerTop, footerBottom) - 1;
 
   // Either a long vertical divider line or the widest low-ink valley near the
   // horizontal center of the content area.
   const colInk = colInkInRange(map, contentTop, contentBottom);
+  // Profiles with `ignoreGutterLogo`: for finding the gutter, a column whose
+  // ink sits in one short stretch of the page (a vertical publisher logo in
+  // the gutter) counts as blank; text and question numbers run the page.
+  const splitInk = opts.ignoreGutterLogo ? Int32Array.from(colInk) : colInk;
+  if (opts.ignoreGutterLogo) {
+    const span = H * 0.15, gap = H * 0.03;
+    for (let x = Math.floor(W * 0.38); x <= Math.ceil(W * 0.62); x++) {
+      let first = -1, last = -1, broken = false;
+      for (let y = contentTop; y < contentBottom && !broken; y++) {
+        if (!map.ink[y * W + x]) continue;
+        if (first < 0) first = y;
+        else if (y - last > gap) broken = true;
+        last = y;
+      }
+      if (first >= 0 && !broken && last - first < span) splitInk[x] = 0;
+    }
+  }
   const contentH = contentBottom - contentTop;
   const lo = Math.floor(W * 0.38), hi = Math.ceil(W * 0.62);
 
   let splitX = findDivider(map, lo, hi, contentTop, contentBottom);
   if (splitX < 0) {
     for (let x = lo; x <= hi; x++) {
-      if (colInk[x] > contentH * 0.55) { splitX = x; break; }
+      if (splitInk[x] > contentH * 0.55) { splitX = x; break; }
+    }
+  }
+  if (splitX < 0 && opts.leftmostGutter) {
+    // Profiles: question numbers hang right of the gutter, and the gap
+    // between them and their text can be as blank as the gutter itself
+    // (or blanker, with a logo or pale rule in the gutter). The gutter is
+    // the leftmost blank run, split at its middle.
+    const win = Math.max(6, Math.round(W * 0.005));
+    const scores = [];
+    for (let x = lo; x <= hi - win; x++) {
+      let s = 0;
+      for (let k = 0; k < win; k++) s += splitInk[x + k];
+      scores.push(s);
+    }
+    const min = Math.min(...scores);
+    const blank = (i) => scores[i] <= min + Math.max(win * 2, min * 0.5);
+    for (let i = 0; i < scores.length; i++) {
+      if (!blank(i)) continue;
+      let j = i;
+      while (j + 1 < scores.length && blank(j + 1)) j++;
+      splitX = lo + Math.round((i + j + win) / 2);
+      break;
     }
   }
   if (splitX < 0) {
@@ -173,7 +217,7 @@ export const detectLayout = (map, labelBoxes = []) => {
     const win = Math.max(8, Math.round(W * 0.01));
     for (let x = lo; x <= hi - win; x++) {
       let s = 0;
-      for (let k = 0; k < win; k++) s += colInk[x + k];
+      for (let k = 0; k < win; k++) s += splitInk[x + k];
       if (s < bestScore) { bestScore = s; bestX = x + Math.floor(win / 2); }
     }
     splitX = bestX;
@@ -195,7 +239,49 @@ export const detectLayout = (map, labelBoxes = []) => {
   while (left < W * 0.2 && colInk[left] <= noise) left++;
   let right = W - 1;
   while (right > W * 0.8 && colInk[right] <= noise) right--;
-
+  // Profiles with `trimEdgeText`: a thin band of ink at the page edge set
+  // apart by a gap, running down the page without a break (vertical "TYT
+  // MATEMATİK SORU BANKASI" spine text, a scan's shadow), isn't part of the
+  // first or last column. A column of question numbers hanging left of
+  // indented text is thin too, but its items have long gaps between them.
+  if (opts.trimEdgeText) {
+    const gapMin = W * 0.012, bandMax = W * 0.035;
+    const continuous = (bx0, bx1) => {
+      let best = 0, run = 0, blank = 0;
+      for (let y = contentTop; y < contentBottom; y++) {
+        let ink = false;
+        for (let x = bx0; x < bx1 && !ink; x++) ink = map.ink[y * W + x] === 1;
+        if (ink) { run += blank + 1; blank = 0; if (run > best) best = run; }
+        else if (++blank > H * 0.02) { run = 0; blank = 0; }
+      }
+      return best >= H * 0.1;
+    };
+    // Scan borders and specks at the very edge go too: nothing printed
+    // sits within 1% of the page edge.
+    const trimmable = (bx0, bx1) => {
+      if (Math.min(bx0, W - bx1) <= W * 0.01 && bx1 - bx0 <= W * 0.01) return true;
+      let most = 0;
+      for (let x = bx0; x < bx1; x++) most = Math.max(most, colInk[x]);
+      return (Math.min(bx0, W - bx1) <= W * 0.01 && most < (contentBottom - contentTop) * 0.03) || continuous(bx0, bx1);
+    };
+    // A band ends where a real gap starts (single faint columns inside
+    // letters don't split it).
+    const blankRun = (x, dir) => { for (let k = 0; k < gapMin; k++) if (colInk[x + dir * k] > noise) return false; return true; };
+    for (let k = 0; k < 3; k++) {
+      let end = left;
+      while (end < W * 0.25 && !(colInk[end] <= noise && blankRun(end, 1))) end++;
+      let next = end;
+      while (next < W * 0.25 && colInk[next] <= noise) next++;
+      if (end - left <= bandMax && next - end >= gapMin && next < W * 0.25 && trimmable(left, end)) left = next; else break;
+    }
+    for (let k = 0; k < 3; k++) {
+      let start = right;
+      while (start > W * 0.75 && !(colInk[start] <= noise && blankRun(start, -1))) start--;
+      let prev = start;
+      while (prev > W * 0.75 && colInk[prev] <= noise) prev--;
+      if (right - start <= bandMax && start - prev >= gapMin && prev > W * 0.75 && trimmable(start + 1, right + 1)) right = prev; else break;
+    }
+  }
   const pad = Math.round(W * 0.006);
   return {
     contentTop,
@@ -655,7 +741,7 @@ const labelStrips = ({ map, layout, columnLines, strictLabels = false, pageLines
  * widened by about a line so word gaps over the gutter don't hide them.
  * Question numbers sit on this edge.
  */
-const columnTextEdge = (map, layout, colIdx) => {
+const columnTextEdge = (map, layout, colIdx, minCount = 3, strictGutter = false) => {
   const W = map.width, H = map.height;
   const [c0, c1] = layout.columns;
   const y0 = layout.contentTop, y1 = layout.contentBottom;
@@ -665,24 +751,45 @@ const columnTextEdge = (map, layout, colIdx) => {
   const fullWidth = new Uint8Array(H);
   for (let y = y0; y < y1; y++) {
     const row = y * map.width;
-    for (let x = c0.x1; x < c1.x0; x++) {
-      if (light[row + x] && !gutterRules.has(x)) {
-        for (let k = Math.max(y0, y - near); k < Math.min(y1, y + near); k++) fullWidth[k] = 1;
-        break;
-      }
+    // `strictGutter` (profiles): a full-width row fills the whole gutter;
+    // vertical text set in the gutter ("ORİJİNAL YAYINLARI") doesn't.
+    let hit = false;
+    if (strictGutter) {
+      hit = true;
+      for (let x = c0.x1; x < c1.x0 && hit; x++) if (!light[row + x] && !gutterRules.has(x)) hit = false;
+    } else {
+      for (let x = c0.x1; x < c1.x0 && !hit; x++) hit = light[row + x] && !gutterRules.has(x);
     }
+    if (hit) for (let k = Math.max(y0, y - near); k < Math.min(y1, y + near); k++) fullWidth[k] = 1;
   }
   const col = layout.columns[colIdx];
   const lo = Math.max(0, Math.round(col.x0 - W * 0.005));
   const hi = Math.round(col.x0 + (col.x1 - col.x0) * 0.3);
   const colRules = verticalRules(map, lo, y0, hi, y1, 0.2);
+  // (`strictGutter` profiles: tall connected shapes — a divider line,
+  // crooked or coloured, a banner — don't set the edge either.)
+  const skip = new Uint8Array((hi - lo) * (y1 - y0));
+  if (strictGutter) {
+    for (const c of components(map, lo, y0, hi, y1)) {
+      if (c.y1 - c.y0 <= H * 0.025) continue;
+      for (let y = c.y0; y < c.y1; y++) for (let x = c.x0; x < c.x1; x++) skip[(y - y0) * (hi - lo) + x - lo] = 1;
+    }
+  }
   const counts = new Int32Array(hi - lo);
   for (let y = y0; y < y1; y++) {
     if (fullWidth[y]) continue;
     const row = y * map.width;
-    for (let x = lo; x < hi; x++) if (map.ink[row + x] && !colRules.has(x)) counts[x - lo]++;
+    for (let x = lo; x < hi; x++) if (map.ink[row + x] && !colRules.has(x) && !skip[(y - y0) * (hi - lo) + x - lo]) counts[x - lo]++;
   }
-  for (let i = 0; i < counts.length; i++) if (counts[i] >= 3) return lo + i;
+  // (`strictGutter` profiles: the edge must be wider than a dotted or
+  // crooked rule, which a few-pixel-wide column of ink can be.)
+  const span = strictGutter ? Math.round(W * 0.0035) : 0;
+  for (let i = 0; i < counts.length; i++) {
+    if (counts[i] < minCount) continue;
+    let wide = true;
+    for (let k = 1; k <= span && wide; k++) wide = i + k < counts.length && counts[i + k] >= minCount;
+    if (wide) return lo + i;
+  }
   return col.x0;
 };
 
@@ -693,21 +800,32 @@ const columnTextEdge = (map, layout, colIdx) => {
  * rules (the column divider) are dropped and the strip is upscaled 2x with a
  * white border. Returns { x0, y0, pad, edge, width, height, gray } or null.
  */
-export const marginStrip = (map, layout, columnLines, colIdx) => {
+export const marginStrip = (map, layout, columnLines, colIdx, opts = {}) => {
   const W = map.width;
-  const edge = columnTextEdge(map, layout, colIdx);
+  // (`dropTall` also means: a few-pixel horizontal rule doesn't set the edge.)
+  const edge = columnTextEdge(map, layout, colIdx, opts.dropTall ? Math.round(map.height * 0.004) : 3, !!opts.dropTall);
   const x0 = Math.max(0, Math.round(edge - W * 0.004));
   const x1 = Math.min(W, Math.round(edge + W * 0.034));
   const y0 = layout.contentTop, y1 = layout.contentBottom;
   if (x1 - x0 < 8 || y1 - y0 < 8) return null;
   const rules = verticalRules(map, x0, y0, x1, y1, 0.2);
+  // `dropTall`: connected shapes much taller than a line (a crooked scan's
+  // divider, header banners, QR codes, figures) are left out; they derail
+  // the OCR of the whole strip. Question numbers are text-sized.
+  const tall = new Uint8Array((x1 - x0) * (y1 - y0));
+  if (opts.dropTall) {
+    for (const c of components(map, x0, y0, x1, y1)) {
+      if (c.y1 - c.y0 <= map.height * 0.025) continue;
+      for (let y = c.y0; y < c.y1; y++) for (let x = c.x0; x < c.x1; x++) tall[(y - y0) * (x1 - x0) + x - x0] = 1;
+    }
+  }
   const pad = 16, sw = x1 - x0, sh = y1 - y0;
   const width = sw * 2 + pad * 2, height = sh * 2 + pad * 2;
   const gray = new Uint8Array(width * height).fill(255);
   for (let y = 0; y < sh; y++) {
     const row = (y0 + y) * map.width;
     for (let x = 0; x < sw; x++) {
-      if (!map.ink[row + x0 + x] || rules.has(x0 + x)) continue;
+      if (!map.ink[row + x0 + x] || rules.has(x0 + x) || tall[y * sw + x]) continue;
       const o = (pad + y * 2) * width + pad + x * 2;
       gray[o] = gray[o + 1] = gray[o + width] = gray[o + width + 1] = 0;
     }
@@ -715,8 +833,49 @@ export const marginStrip = (map, layout, columnLines, colIdx) => {
   return { x0, y0, pad, edge, width, height, gray };
 };
 
+/**
+ * Profiles with `headerFromLabels`: where content really starts when the
+ * header band holds the first questions (pages without a banner). Margin
+ * labels read from near the top of the page; the first one above the
+ * detected content top moves it up.
+ */
+export const contentTopFromLabels = (layout, marginLabels, H) => {
+  const ys = marginLabels.flat().map(m => m.bbox.y0);
+  if (!ys.length) return layout.contentTop;
+  const first = Math.min(...ys);
+  return first < layout.contentTop ? Math.max(0, Math.round(first - H * 0.006)) : layout.contentTop;
+};
+
+/**
+ * Text-sized blobs of a marginStrip() image (each a candidate question
+ * number), as images to read one at a time: OCR of a whole strip can drop
+ * a number it reads fine on its own. Profiles re-read the blobs the strip
+ * read missed. -> [{ y0, y1, image: { width, height, data } }] (strip px).
+ */
+export const marginStripBlobs = (strip, H) => {
+  const { width, height, gray } = strip;
+  const minH = H * 0.005 * 2, maxH = H * 0.03 * 2, pad = 12;
+  const out = [];
+  let start = -1, last = -1;
+  const flush = () => {
+    if (start >= 0 && last - start + 1 >= minH && last - start + 1 <= maxH) {
+      const y0 = Math.max(0, start - pad), y1 = Math.min(height, last + 1 + pad);
+      const data = gray.slice(y0 * width, y1 * width);
+      out.push({ y0, y1, image: { width, height: y1 - y0, data } });
+    }
+    start = -1;
+  };
+  for (let y = 0; y < height; y++) {
+    let ink = false;
+    for (let x = 0, row = y * width; x < width && !ink; x++) ink = gray[row + x] === 0;
+    if (ink) { if (start < 0) start = y; last = y; } else if (start >= 0 && y - last > 8) flush();
+  }
+  flush();
+  return out;
+};
+
 /** OCR words from a marginStrip() image -> [{ n, bbox }] in page coordinates. */
-export const marginLabelsFromWords = (words, strip, H) => {
+export const marginLabelsFromWords = (words, strip, H, opts = {}) => {
   const out = [];
   for (const w of words) {
     // "5."; "5.4" is "5." merged with the first letter of the text. Bare
@@ -732,7 +891,9 @@ export const marginLabelsFromWords = (words, strip, H) => {
     if (h < H * 0.005 || h > H * 0.03) continue;
     // Numbers start at the text edge; anything further in is a cut-off
     // piece of body text.
-    if (bbox.x0 > strip.edge + H * 0.008) continue;
+    // (Profiles allow more room: on crooked scans the measured edge can
+    // land a little left of the numbers.)
+    if (bbox.x0 > strip.edge + H * (opts.edgeTolerance ?? 0.008)) continue;
     out.push({ n: parseInt(m[1], 10), bbox });
   }
   return out;
@@ -866,7 +1027,8 @@ export const capHeightFromStrips = (strips, H, fromTextLayer) => {
  * `strictLabels` (PDF text layers) requires "N." exactly; OCR input also
  * accepts "N," since Tesseract often misreads the period. `pageLines` (all
  * text lines on the page, defaults to the columns') are scanned for section
- * headings. OCR input may add `marginLabels` (see labelStrips),
+ * headings. `answerSheetGuard: false` (profiles) keeps one-line questions
+ * whose options start right under the number. OCR input may add `marginLabels` (see labelStrips),
  * `extraOptionLines[col]` (sparse re-reads of optionless strips) and
  * `passageLines[col]` (instructions read from unreadBands()). Questions that
  * share a passage get a `contextBox` (see attachPassages).
@@ -906,13 +1068,25 @@ export const findQuestions = (params) => {
     // rows ("18 Ⓐ Ⓑ Ⓒ Ⓓ Ⓔ") in scans put them on one line. (Text layers
     // don't need the guard, and some questions set options beside their
     // first statement.)
-    if (!params.strictLabels && options.top <= s.y0 + H * 0.012) continue;
+    if (!params.strictLabels && params.answerSheetGuard !== false && options.top <= s.y0 + H * 0.012) continue;
     tests.push({ ...s, options });
   }
 
   const gapRows = Math.round(H * 0.022);
   const regions = [];
-  for (const q of filterSequence(tests)) {
+  // `numberingRestarts` (profiles): numbering starts over under each
+  // sub-heading of a learning page, so the sequence check runs per group:
+  // a group ends where a number drops below the one before it.
+  let sequence;
+  if (params.numberingRestarts) {
+    const groups = [];
+    for (const t of tests) {
+      const g = groups[groups.length - 1];
+      if (!g || t.n < g[g.length - 1].n) groups.push([t]); else g.push(t);
+    }
+    sequence = groups.flatMap(filterSequence);
+  } else sequence = filterSequence(tests);
+  for (const q of sequence) {
     const col = layout.columns[q.col];
     const bodyX0 = q.labelRight + Math.round(W * 0.004);
     const rules = verticalRules(map, col.x0, q.stripTop, col.x1 + 1, q.options.bottom);
@@ -1434,6 +1608,237 @@ export const resolveWeeks = (pages) => {
     for (const i of run.idx) if (pages[i].week || pages[i].weekUnsure) out[i] = run.week;
   }
   return out;
+};
+
+// ---------------------------------------------------------------------------
+// Printed answer keys ("1.C 2.B 3.D", "1-B 2-B") — profiles with `answerKey`
+// ---------------------------------------------------------------------------
+
+/** The band of the page holding the printed answers (analysis coordinates). */
+export const answerKeyBand = (W, H, spec) => (spec?.band === 'top'
+  ? { x0: 0, y0: Math.round(H * 0.02), x1: W, y1: Math.round(H * 0.14) }
+  : { x0: 0, y0: Math.round(H * 0.88), x1: W, y1: H });
+
+/**
+ * Images of the answer band for OCR, one per pass: long horizontal and
+ * vertical strokes (the capsule frames some books draw around the answers,
+ * column rules) erased, then upscaled and thresholded. Small grey answer
+ * text reads very differently per setting, so callers OCR each pass and
+ * merge with parseAnswerKey. -> [{ width, height, data }] (1 channel).
+ */
+export const answerKeyImages = (pixels, W, H, channels, band, spec = {}) => {
+  const bw = band.x1 - band.x0, bh = band.y1 - band.y0;
+  const g = new Uint8Array(bw * bh);
+  for (let y = 0; y < bh; y++) {
+    for (let x = 0; x < bw; x++) {
+      const i = ((band.y0 + y) * W + band.x0 + x) * channels;
+      g[y * bw + x] = channels === 1 ? pixels[i] : 0.299 * pixels[i] + 0.587 * pixels[i + 1] + 0.114 * pixels[i + 2];
+    }
+  }
+  const dark = (v) => v < 200;
+  const hLen = Math.round(bw * 0.03), vLen = Math.round(bh * 0.25);
+  for (let y = 0; y < bh; y++) {
+    let run = 0;
+    for (let x = 0; x <= bw; x++) {
+      if (x < bw && dark(g[y * bw + x])) { run++; continue; }
+      if (run > hLen) for (let k = x - run; k < x; k++) g[y * bw + k] = 255;
+      run = 0;
+    }
+  }
+  for (let x = 0; x < bw; x++) {
+    let run = 0;
+    for (let y = 0; y <= bh; y++) {
+      if (y < bh && dark(g[y * bw + x])) { run++; continue; }
+      if (run > vLen) for (let k = y - run; k < y; k++) g[k * bw + x] = 255;
+      run = 0;
+    }
+  }
+  // Keep only the answer line: the band also catches option lines and
+  // figure labels above it ("12 . A", "86.B"). Answers sit on the last two
+  // text lines of a bottom band (beside or above the page number), the
+  // first two of a top band (beside or below the test title).
+  const lines = [];
+  for (let y = 0, start = -1, blank = 0; y <= bh; y++) {
+    let ink = false;
+    if (y < bh) for (let x = 0; x < bw && !ink; x++) ink = dark(g[y * bw + x]);
+    if (ink) { if (start < 0) start = y; blank = 0; continue; }
+    if (start >= 0 && (++blank > 3 || y === bh)) { lines.push([start, y - blank + 1]); start = -1; blank = 0; }
+  }
+  const textLines = lines.filter(([a, b]) => b - a >= 4);
+  const keep = spec.band === 'top' ? textLines.slice(0, 2) : textLines.slice(-2);
+  if (keep.length && spec.lines) {
+    const top = Math.max(0, keep[0][0] - 4), bottom = Math.min(bh, keep[keep.length - 1][1] + 4);
+    for (let y = 0; y < bh; y++) if (y < top || y >= bottom) g.fill(255, y * bw, (y + 1) * bw);
+  }
+  // Stretch contrast (grey print on a scanned page).
+  let lo = 255, hi = 0;
+  for (const v of g) { if (v < lo) lo = v; if (v > hi) hi = v; }
+  const span = Math.max(1, hi - lo);
+  for (let i = 0; i < g.length; i++) g[i] = Math.round(((g[i] - lo) * 255) / span);
+  const pass = (up, thr) => {
+    const width = bw * up, height = bh * up, data = new Uint8Array(width * height);
+    for (let y = 0; y < height; y++) {
+      const fy = (y + 0.5) / up - 0.5, ya = Math.max(0, Math.floor(fy)), yb = Math.min(bh - 1, ya + 1), wy = Math.max(0, fy - ya);
+      for (let x = 0; x < width; x++) {
+        const fx = (x + 0.5) / up - 0.5, xa = Math.max(0, Math.floor(fx)), xb = Math.min(bw - 1, xa + 1), wx = Math.max(0, fx - xa);
+        const v = (g[ya * bw + xa] * (1 - wx) + g[ya * bw + xb] * wx) * (1 - wy) + (g[yb * bw + xa] * (1 - wx) + g[yb * bw + xb] * wx) * wy;
+        data[y * width + x] = thr ? (v > thr ? 255 : 0) : Math.round(v);
+      }
+    }
+    return { width, height, data };
+  };
+  return [pass(2, 170), pass(3, 170), pass(1, 0)];
+};
+
+/**
+ * OCR texts of the answer-band passes -> [{ n, letter }] sorted by n: each
+ * "N.X" / "N-X" / "N)X" reading counted once per pass, the most-read letter
+ * winning for each number.
+ */
+export const parseAnswerKey = (texts) => {
+  const votes = new Map();
+  for (const t of texts) {
+    const seen = new Set();
+    for (const m of (t ?? '').matchAll(/(\d{1,2})\s*[.\-)]\s*([A-E])\b/g)) {
+      const n = +m[1], key = `${n}${m[2]}`;
+      if (n < 1 || n > MAX_QUESTION_NUMBER || seen.has(key)) continue;
+      seen.add(key);
+      const v = votes.get(n) ?? new Map();
+      v.set(m[2], (v.get(m[2]) ?? 0) + 1);
+      votes.set(n, v);
+    }
+  }
+  const found = [...votes.entries()]
+    .map(([n, v]) => ({ n, letter: [...v.entries()].sort((a, b) => b[1] - a[1])[0][0] }))
+    .sort((a, b) => a.n - b.n);
+  // A page's answers are consecutive numbers; one with no neighbour within
+  // two is a misread (a figure label, "86.B" for "8.B").
+  if (found.length <= 2) return found;
+  return found.filter(a => found.some(b => b !== a && Math.abs(b.n - a.n) <= 2));
+};
+
+/**
+ * A book's crops against its printed answers. Tests are found from the
+ * crops: question numbers run up within a test and start over in the next
+ * one. A test's answers may be printed on any of its pages (every page, its
+ * last page, or its first), so each answer joins the test whose pages it
+ * was read on — or the nearest test before it.
+ * pages (book order): [{ page, questions: [n], answers: [{ n, letter }] }]
+ * -> { tests: [{ pages: [p0, p1], questions, answered, missing, extra }],
+ *      answerOf: (pageIndex, n) => letter | undefined }
+ */
+export const checkAnswers = (pages) => {
+  const tests = [];
+  let cur = null;
+  pages.forEach((p, i) => {
+    for (const n of [...p.questions].sort((a, b) => a - b)) {
+      if (!cur || n <= cur.last) { cur = { first: i, lastPage: i, last: n, questions: [], answers: new Map() }; tests.push(cur); }
+      cur.questions.push(n); cur.last = n; cur.lastPage = i;
+    }
+  });
+  const testAt = (i) => {
+    let best = null;
+    for (const t of tests) {
+      if (i >= t.first && i <= t.lastPage) return t;
+      if (t.first <= i) best = t;
+    }
+    return best;
+  };
+  pages.forEach((p, i) => {
+    for (const a of p.answers ?? []) {
+      // Answers printed on a test's first page can belong to the questions
+      // of a page further on, still inside the same numbering run.
+      const t = testAt(i);
+      if (t && !t.answers.has(a.n)) t.answers.set(a.n, a.letter);
+    }
+  });
+  const out = tests.map(t => {
+    const have = new Set(t.questions);
+    const keys = [...t.answers.keys()].sort((a, b) => a - b);
+    // Printed numbers run on without holes: within a run of answers (no gap
+    // over two) a number OCR missed still counts as printed. A lone number
+    // far from the rest is a stray read, unless it fits the questions found.
+    const printed = new Set();
+    const maxQ = Math.max(0, ...t.questions);
+    for (let i = 0; i < keys.length;) {
+      let j = i;
+      while (j + 1 < keys.length && keys[j + 1] - keys[j] <= 2) j++;
+      if (j > i) { for (let n = keys[i]; n <= keys[j]; n++) printed.add(n); }
+      else if (keys[i] <= maxQ + 1) printed.add(keys[i]);
+      i = j + 1;
+    }
+    // Tests start at 1: answers 3..12 mean 1 and 2 were printed too.
+    const top = Math.max(0, ...printed);
+    if (printed.size && Math.min(...printed) <= 3) for (let n = 1; n <= top; n++) printed.add(n);
+    return {
+      pages: [t.first, t.lastPage],
+      questions: t.questions,
+      answered: keys.length,
+      missing: [...printed].filter(n => !have.has(n)).sort((a, b) => a - b),
+      extra: top ? t.questions.filter(n => n > top) : [],
+      answers: t.answers,
+    };
+  });
+  const answerOf = (i, n) => {
+    const t = tests.find(t => i >= t.first && i <= t.lastPage && t.questions.includes(n));
+    return t ? t.answers.get(n) : undefined;
+  };
+  return { tests: out, answerOf };
+};
+
+/**
+ * Tests in a book from its crops' question numbers (book order): numbers
+ * run up within a test and start over in the next one. Pages without
+ * questions join the test before them. -> test index per page (-1 before
+ * the first test).
+ */
+export const testSegments = (questionsPerPage) => {
+  const out = [];
+  let idx = -1, last = Infinity;
+  for (const qs of questionsPerPage) {
+    const sorted = [...qs].sort((a, b) => a - b);
+    if (sorted.length && sorted[0] <= last) idx++;
+    if (sorted.length) last = sorted[sorted.length - 1];
+    out.push(idx);
+  }
+  return out;
+};
+
+/**
+ * A header line worth using as a topic, or undefined: mostly letters, at
+ * least one real word, and not on the profile's ignore list (series
+ * banners like "ÖSYM TARZI SORULAR", difficulty gauges). Scanned banners
+ * otherwise OCR to junk like "EK. DD" or "KR > KC Vibe".
+ */
+export const plausibleTopic = (text, ignore = []) => {
+  // OCR debris at either end ("> SAğ MUTLAK DEĞER Ce)") goes first: end
+  // words must be real words of four letters or more.
+  // A topic stops at the first number ("Çarpanlara Ayırma BÖLÜM 01 Test");
+  // section words aren't part of it.
+  const all = (text ?? '').replace(/\s+/g, ' ').trim().split(' ');
+  const cut = all.findIndex(w => /\d/.test(w));
+  const tokens = (cut >= 0 ? all.slice(0, cut) : all).filter(w => !/^(BÖLÜM|BOLUM|TEST|ÜNİTE|UNITE)$/i.test(w));
+  const word = (w) => /^\p{L}{4,}$/u.test((w ?? '').replace(/[.,:;'’]+$/, ''));
+  while (tokens.length && !word(tokens[0])) tokens.shift();
+  while (tokens.length && !word(tokens[tokens.length - 1])) tokens.pop();
+  const t = tokens.join(' ');
+  if (!t) return undefined;
+  // (Turkish-aware case folding: "ACİL" matches "acil".)
+  const folded = t.toLocaleLowerCase('tr');
+  if (ignore.some(re => new RegExp(re, 'i').test(folded))) return undefined;
+  const letters = (t.match(/\p{L}/gu) ?? []).length;
+  const words = t.split(' ').filter(w => /^\p{L}{4,}$/u.test(w.replace(/[.,:;'’-]/g, '')));
+  if (letters < 6 || letters / t.replace(/ /g, '').length < 0.85 || !words.length) return undefined;
+  return t;
+};
+
+/** The most common non-empty value (first one on ties), or undefined. */
+export const majority = (values) => {
+  const counts = new Map();
+  for (const v of values) if (v) counts.set(v, (counts.get(v) ?? 0) + 1);
+  let best, n = 0;
+  for (const [v, c] of counts) if (c > n) { best = v; n = c; }
+  return best;
 };
 
 const upperTr = (s) => s.toLocaleUpperCase('tr');

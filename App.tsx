@@ -2,7 +2,8 @@ import React, { useState, useEffect, useRef, useCallback, useMemo } from 'react'
 import Uploader from './components/Uploader';
 import { analyzeTestPageLocal } from './services/localAnalyzer';
 import { expandFiles, LoadedPage, PDF_EXPORT_DPI } from './services/fileLoader';
-import { cropFileName, resolveTopics, resolveWeeks, imageSequence, cropRect, maskRect, stackLayout } from './core/qcropCore.mjs';
+import { cropFileName, resolveTopics, resolveWeeks, imageSequence, cropRect, maskRect, stackLayout, checkAnswers, testSegments, majority } from './core/qcropCore.mjs';
+import { PROFILES, profileOptions } from './core/profiles.mjs';
 import { QuestionRegion, AppStatus, BoundingBox, PageData } from './types';
 import { LoaderIcon, DownloadIcon, ScissorsIcon, TrashIcon, PlusIcon } from './components/Icons';
 
@@ -65,6 +66,13 @@ export default function App() {
   useEffect(() => {
     try { localStorage.setItem('qcrop.weekInNames', weekInNames ? '1' : '0'); } catch { /* storage unavailable */ }
   }, [weekInNames]);
+  // Book profile (core/profiles.mjs) used for analysis; '' = defaults.
+  const [profile, setProfile] = useState<string>(() => {
+    try { const p = localStorage.getItem('qcrop.profile') ?? ''; return p in PROFILES ? p : ''; } catch { return ''; }
+  });
+  useEffect(() => {
+    try { localStorage.setItem('qcrop.profile', profile); } catch { /* storage unavailable */ }
+  }, [profile]);
   const [exportProgress, setExportProgress] = useState<string | null>(null);
   const dragRef = useRef<DragState | null>(null);
 
@@ -140,6 +148,66 @@ export default function App() {
     }
     return out;
   }, [pages]);
+
+  // Printed answers vs crops (profiles with answer keys), per book: each
+  // crop's answer, and per page the questions its test is missing.
+  const answerCheck = useMemo(() => {
+    const answerOf = new Map<string, string>(); // region id -> letter
+    const missingOn = new Map<string, number[]>(); // page id -> missing numbers of its test
+    const byBook = new Map<string, { page: PageData; order: number }[]>();
+    for (const p of pages) {
+      if (!p.answers || p.status !== 'READY') continue;
+      const book = bookOf(p) ?? { key: `page:${p.id}`, order: 0 };
+      if (!byBook.has(book.key)) byBook.set(book.key, []);
+      byBook.get(book.key)!.push({ page: p, order: book.order });
+    }
+    for (const group of byBook.values()) {
+      group.sort((a, b) => a.order - b.order);
+      const check = checkAnswers(group.map(({ page }) => ({
+        page: page.pageNumber, questions: page.regions.map(r => parseInt(r.questionNumber, 10)).filter(n => !isNaN(n)), answers: page.answers,
+      })));
+      group.forEach(({ page }, k) => page.regions.forEach(r => {
+        const letter = check.answerOf(k, parseInt(r.questionNumber, 10));
+        if (letter) answerOf.set(r.id, letter);
+      }));
+      for (const t of check.tests) {
+        if (!t.missing.length) continue;
+        for (let k = t.pages[0]; k <= t.pages[1]; k++) missingOn.set(group[k].page.id, t.missing);
+      }
+    }
+    return { answerOf, missingOn };
+  }, [pages]);
+
+  // Profiles naming per test: a test's number and topic come from whichever
+  // of its pages read them (the most common reading wins).
+  const perTestNames = useMemo(() => {
+    const testOf = new Map<string, string | undefined>();
+    const topicOf = new Map<string, string | undefined>();
+    if (!profileOptions(profile).namesPerTest) return { testOf, topicOf };
+    const byBook = new Map<string, { page: PageData; order: number }[]>();
+    for (const p of pages) {
+      if (p.status !== 'READY') continue;
+      const book = bookOf(p) ?? { key: `page:${p.id}`, order: 0 };
+      if (!byBook.has(book.key)) byBook.set(book.key, []);
+      byBook.get(book.key)!.push({ page: p, order: book.order });
+    }
+    for (const group of byBook.values()) {
+      group.sort((a, b) => a.order - b.order);
+      const seg = testSegments(group.map(({ page }) => page.regions.map(r => parseInt(r.questionNumber, 10)).filter(n => !isNaN(n))));
+      const members = new Map<number, PageData[]>();
+      group.forEach(({ page }, k) => { if (!members.has(seg[k])) members.set(seg[k], []); members.get(seg[k])!.push(page); });
+      for (const ps of members.values()) {
+        const test = majority(ps.map(p => p.testNumber));
+        const topic = majority(ps.map(p => p.plainTopic));
+        for (const p of ps) { testOf.set(p.id, test); topicOf.set(p.id, topic); }
+      }
+    }
+    return { testOf, topicOf };
+  }, [pages, profile]);
+
+  /** The topic shown and used for a page: per test under profiles that name per test. */
+  const pageTopic = (pageId: string) =>
+    perTestNames.topicOf.has(pageId) ? perTestNames.topicOf.get(pageId) : topicByPage.get(pageId);
 
   const topicByPage = useMemo(() => {
     const out = new Map<string, string | undefined>();
@@ -226,7 +294,7 @@ export default function App() {
         img.onerror = reject;
       });
 
-      const result = await analyzeTestPageLocal(img, textItems, { bookPage: !!bookOf(pendingPage) });
+      const result = await analyzeTestPageLocal(img, textItems, { bookPage: !!bookOf(pendingPage), profile });
 
       let pageNumber = result.pageNumber;
       let pageLabel: string;
@@ -275,6 +343,8 @@ export default function App() {
         week: result.week,
         weekUnsure: result.weekUnsure,
         weekGlyphs: result.weekGlyphs,
+        answers: result.answers,
+        plainTopic: result.plainTopic,
         regions: regionsWithData
       } : p));
     } catch (err: any) {
@@ -692,8 +762,8 @@ export default function App() {
 
   const cropFilename = (region: QuestionRegion, pageId: string) => cropFileName({
     week: weekInNames ? weekByPage.get(pageId) : undefined,
-    testNumber: region.testNumber,
-    topic: topicByPage.get(pageId) ?? region.topic,
+    testNumber: perTestNames.testOf.has(pageId) ? perTestNames.testOf.get(pageId) : region.testNumber,
+    topic: perTestNames.topicOf.has(pageId) ? perTestNames.topicOf.get(pageId) : (topicByPage.get(pageId) ?? region.topic),
     questionNumber: region.questionNumber,
     pageLabel: region.pageLabel ?? region.pageNumber,
   });
@@ -705,6 +775,7 @@ export default function App() {
     const jobs = pages.flatMap(page => page.regions.filter(r => r.croppedDataUrl).map(region => ({ page, region })));
     // Same name twice (a number used twice) would overwrite: add _2, _3.
     const used = new Set<string>();
+    const names: string[] = [];
     try {
       for (let i = 0; i < jobs.length; i++) {
         setExportProgress(`${i + 1} / ${jobs.length}`);
@@ -713,7 +784,14 @@ export default function App() {
         let name = cropFilename(region, page.id);
         for (let k = 2; used.has(name); k++) name = cropFilename(region, page.id).replace(/\.jpg$/, `_${k}.jpg`);
         used.add(name);
+        names.push(name);
         if (blob) zip.file(name, blob);
+      }
+      // The printed answers of every exported crop (profiles with answer keys).
+      if (pages.some(p => p.answers)) {
+        const q = (v: string) => /[",\n]/.test(v) ? `"${v.replace(/"/g, '""')}"` : v;
+        const rows = jobs.map(({ page, region }, i) => [names[i], page.pageLabel ?? page.pageNumber, region.questionNumber, answerCheck.answerOf.get(region.id) ?? '']);
+        zip.file('answers.csv', ['file,page,question,answer', ...rows.map(r => r.map(v => q(String(v))).join(','))].join('\n') + '\n');
       }
       setExportProgress('Zipping…');
       saveBlob(await zip.generateAsync({ type: 'blob' }), 'q-crop-export.zip');
@@ -744,11 +822,33 @@ export default function App() {
           </div>
         </div>
         
-        {pages.length > 0 && (
-          <button onClick={() => {setPages([]); setActivePageId(null);}} className="px-5 py-2.5 text-sm font-black text-slate-600 hover:text-red-600 bg-slate-100 hover:bg-red-50 rounded-xl transition-all uppercase tracking-widest">
-            Reset App
-          </button>
-        )}
+        <div className="flex items-center gap-3">
+          <label className="flex items-center gap-2" title="Settings for book series the default analysis doesn't handle (scanned question banks). Default = the standard analysis.">
+            <span className="text-[10px] uppercase tracking-widest text-slate-400 font-black">Book profile</span>
+            <select
+              value={profile}
+              onChange={e => {
+                const next = e.target.value;
+                if (pages.length > 0 && !window.confirm('Analyze all pages again with this profile? Boxes you changed by hand will be lost.')) return;
+                setProfile(next);
+                if (pages.length > 0) {
+                  setPages(prev => prev.map(p => ({ ...p, status: 'IDLE', regions: [] })));
+                  setIsProcessing(true);
+                }
+              }}
+              disabled={isProcessing}
+              className="text-sm font-bold text-slate-700 bg-slate-100 rounded-xl px-3 py-2 outline-none focus:ring-2 focus:ring-brand-300 disabled:opacity-50"
+            >
+              <option value="">Default</option>
+              {Object.entries(PROFILES).map(([key, p]) => <option key={key} value={key}>{p.label}</option>)}
+            </select>
+          </label>
+          {pages.length > 0 && (
+            <button onClick={() => {setPages([]); setActivePageId(null);}} className="px-5 py-2.5 text-sm font-black text-slate-600 hover:text-red-600 bg-slate-100 hover:bg-red-50 rounded-xl transition-all uppercase tracking-widest">
+              Reset App
+            </button>
+          )}
+        </div>
       </header>
 
       <main className="flex-1 flex overflow-hidden">
@@ -841,10 +941,10 @@ export default function App() {
                           <span className="text-brand-600">Test {activePage.testNumber}</span>
                         </>
                       )}
-                      {activePage && topicByPage.get(activePage.id) && (
+                      {activePage && pageTopic(activePage.id) && (
                         <>
                           <span className="w-1 h-1 bg-slate-300 rounded-full"></span>
-                          <span className="text-slate-500">{topicByPage.get(activePage.id)}</span>
+                          <span className="text-slate-500">{pageTopic(activePage.id)}</span>
                         </>
                       )}
                    </div>
@@ -935,9 +1035,14 @@ export default function App() {
                           </span>
                         )}
                       </div>
-                      {topicByPage.get(page.id) && (
+                      {pageTopic(page.id) && (
                         <span className="text-[10px] text-slate-400 font-bold truncate mt-1 pl-9">
-                          {topicByPage.get(page.id)}
+                          {pageTopic(page.id)}
+                        </span>
+                      )}
+                      {answerCheck.missingOn.get(page.id) && (
+                        <span className="text-[10px] text-red-600 font-bold mt-1 pl-9" title="The printed answers of this test list questions that have no crop: add their boxes by hand or fix their numbers.">
+                          Self-check: Q{answerCheck.missingOn.get(page.id)!.join(', Q')} of this test not cropped
                         </span>
                       )}
                     </div>
@@ -977,6 +1082,11 @@ export default function App() {
                                 Q{region.questionNumber}
                                 <span className="opacity-60 text-[9px]">✎</span>
                               </button>
+                            )}
+                            {answerCheck.answerOf.get(region.id) && (
+                              <span className="text-[9px] font-black mt-1 px-1.5 py-0.5 rounded-md w-fit bg-emerald-50 text-emerald-700" title="Answer printed in the book">
+                                Answer {answerCheck.answerOf.get(region.id)}
+                              </span>
                             )}
                             {page.regions.some(o => o.id !== region.id && o.questionNumber === region.questionNumber) && (
                               <span className="text-[9px] font-bold text-red-600 mt-1">Same number used twice on this page</span>

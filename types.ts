@@ -37,6 +37,8 @@ export interface PageData {
   week?: string;       // header week badge as read ("10. HAFTA" -> "10"), see weekByPage
   weekUnsure?: boolean;
   weekGlyphs?: { aspect: number; bits: string }[]; // badge digit shapes (scans)
+  answers?: { n: number; letter: string }[]; // answers printed on the page (profiles with answerKey)
+  plainTopic?: string; // header line that reads as a topic (profiles naming per test)
   pdf?: PdfPageRef;
   error?: string;
 }

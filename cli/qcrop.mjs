@@ -12,12 +12,13 @@
 
 import sharp from 'sharp';
 import { createWorker, createScheduler } from 'tesseract.js';
-import { readdir, mkdir, stat, mkdtemp, rm } from 'fs/promises';
+import { readdir, mkdir, stat, mkdtemp, rm, writeFile } from 'fs/promises';
 import { execFile } from 'child_process';
 import { promisify } from 'util';
 import path from 'path';
 import os from 'os';
 import * as core from '../core/qcropCore.mjs';
+import { profileOptions, PROFILES } from '../core/profiles.mjs';
 
 const execFileP = promisify(execFile);
 
@@ -39,16 +40,23 @@ let png = false;
 // Prefix crops with the page's week ("6_hafta_..."), for books whose answer
 // keys are listed by week.
 let week = false;
+// Book profile (core/profiles.mjs): settings for book series the defaults
+// don't handle. None = the defaults every earlier book was verified with.
+let profileName = '';
 const inputs = [];
 for (let i = 0; i < args.length; i++) {
   if (args[i] === '-o' || args[i] === '--out') outDir = args[++i];
   else if (args[i] === '--dpi') dpi = parseInt(args[++i], 10);
   else if (args[i] === '--png') png = true;
   else if (args[i] === '--week') week = true;
+  else if (args[i] === '--profile') profileName = args[++i];
   else inputs.push(args[i]);
 }
+let opts;
+try { opts = profileOptions(profileName); } catch (err) { console.error(err.message); process.exit(1); }
 if (inputs.length === 0 || !(dpi >= 72 && dpi <= 1200)) {
-  console.error('Usage: node cli/qcrop.mjs <PDFs, images or folders...> [-o <output dir>] [--dpi <72-1200, default 600>] [--png] [--week]');
+  console.error('Usage: node cli/qcrop.mjs <PDFs, images or folders...> [-o <output dir>] [--dpi <72-1200, default 600>] [--png] [--week] [--profile <name>]');
+  console.error(`Profiles: ${Object.keys(PROFILES).join(', ')}`);
   process.exit(1);
 }
 
@@ -202,6 +210,7 @@ const getLabelPool = makePool({ tessedit_char_whitelist: '0123456789.', tessedit
 const getSparsePool = makePool({ tessedit_pageseg_mode: '11' }, 2);
 const getLetterPool = makePool({ tessedit_char_whitelist: 'ABCDE', tessedit_pageseg_mode: '10' }, 2);
 const getWeekPool = makePool({ tessedit_char_whitelist: '0123456789.', tessedit_pageseg_mode: '7' }, 2);
+const getKeyPool = makePool({ tessedit_char_whitelist: '0123456789.-)/ABCDE ', tessedit_pageseg_mode: '11' }, 2);
 
 let digitWorkerPromise = null;
 const getDigitWorker = () => {
@@ -243,7 +252,7 @@ const analyzePage = async (page) => {
   const map = core.buildInkMap(gray, W, H, 1);
   const fromText = core.textLayerUsable(page.textItems);
   const words = fromText ? core.wordsFromTextItems(page.textItems, W, H) : [];
-  const layout = core.detectLayout(map, core.labelBoxesFromWords(words));
+  const layout = core.detectLayout(map, core.labelBoxesFromWords(words), opts);
 
   // A region (analysis coords) cut from the full-resolution original.
   const regionPng = async (x0, y0, x1, y1, upscale = 1, blur = 0) => {
@@ -268,7 +277,7 @@ const analyzePage = async (page) => {
     return linesOf(data, x0, y0, upscale);
   };
 
-  let headerLines, footerLines, columnLines, allLines;
+  let headerLines, footerLines, columnLines, allLines, marginLabels;
   if (fromText) {
     headerLines = core.linesInRegion(words, 0, 0, W, layout.contentTop);
     footerLines = core.linesInRegion(words, 0, layout.footerTop, W, H);
@@ -276,6 +285,46 @@ const analyzePage = async (page) => {
       core.linesInRegion(words, c.x0 - 5, layout.contentTop, c.x1 + 5, layout.contentBottom));
     allLines = core.groupLines(words);
   } else {
+    // Question numbers read on their own from each column's margin (from
+    // near the page top when the profile says the first questions may sit
+    // where a header would be).
+    const readMargins = (lay) => {
+      const stripLayout = opts.headerFromLabels ? { ...lay, contentTop: Math.round(H * 0.015) } : lay;
+      return Promise.all(lay.columns.map(async (_, ci) => {
+        const strip = core.marginStrip(map, stripLayout, null, ci, { dropTall: opts.headerFromLabels });
+        if (!strip) return [];
+        const png = await sharp(Buffer.from(strip.gray), { raw: { width: strip.width, height: strip.height, channels: 1 } })
+          .png().toBuffer();
+        const { data } = await (await getLabelPool()).addJob('recognize', png, {}, { blocks: true });
+        const words = (data.blocks ?? []).flatMap(b => b.paragraphs.flatMap(p => p.lines.flatMap(l => l.words)));
+        const labelOpts = { edgeTolerance: opts.headerFromLabels ? 0.02 : undefined };
+        if (opts.headerFromLabels) {
+          // Numbers the whole-strip read missed, read one blob at a time.
+          const read = core.marginLabelsFromWords(words, strip, H, labelOpts).map(m => (m.bbox.y0 - strip.y0) * 2 + strip.pad);
+          for (const blob of core.marginStripBlobs(strip, H)) {
+            if (read.some(y => y >= blob.y0 - 4 && y <= blob.y1)) continue;
+            const bpng = await sharp(Buffer.from(blob.image.data), { raw: { width: blob.image.width, height: blob.image.height, channels: 1 } }).png().toBuffer();
+            const r = await (await getWeekPool()).addJob('recognize', bpng, {}, { blocks: true });
+            for (const w of (r.data.blocks ?? []).flatMap(b => b.paragraphs.flatMap(p => p.lines.flatMap(l => l.words)))) {
+              words.push({ ...w, bbox: { ...w.bbox, y0: w.bbox.y0 + blob.y0, y1: w.bbox.y1 + blob.y0 } });
+            }
+          }
+        }
+        return core.marginLabelsFromWords(words, strip, H, labelOpts);
+      }));
+    };
+    marginLabels = await readMargins(layout);
+    // A column without a single number: the split may have cut its numbers
+    // off (a logo or dotted rule in the gutter). The other split strategy
+    // wins if it finds more numbers.
+    if (opts.headerFromLabels && marginLabels.some(m => m.length === 0)) {
+      const alt = core.detectLayout(map, core.labelBoxesFromWords(words), { ...opts, leftmostGutter: !opts.leftmostGutter });
+      if (alt.columns[0].x1 !== layout.columns[0].x1) {
+        const altLabels = await readMargins(alt);
+        if (altLabels.flat().length > marginLabels.flat().length) { layout.columns = alt.columns; marginLabels = altLabels; }
+      }
+    }
+    if (opts.headerFromLabels) layout.contentTop = core.contentTopFromLabels(layout, marginLabels, H);
     [headerLines, footerLines, ...columnLines] = await Promise.all([
       ocrRegion(0, 0, W, layout.contentTop, 2),
       ocrRegion(0, layout.footerTop, W, H, 2.5, 2.5),
@@ -307,16 +356,6 @@ const analyzePage = async (page) => {
     if (pending.length) await readShapeLetters(pending, core.capHeightFromStrips(pending, H, true), extraOptionLines);
     regions = core.findQuestions({ ...params, extraOptionLines });
   } else {
-    // Question numbers read on their own from each column's margin.
-    const marginLabels = await Promise.all(layout.columns.map(async (_, ci) => {
-      const strip = core.marginStrip(map, layout, columnLines, ci);
-      if (!strip) return [];
-      const png = await sharp(Buffer.from(strip.gray), { raw: { width: strip.width, height: strip.height, channels: 1 } })
-        .png().toBuffer();
-      const { data } = await (await getLabelPool()).addJob('recognize', png, {}, { blocks: true });
-      const words = (data.blocks ?? []).flatMap(b => b.paragraphs.flatMap(p => p.lines.flatMap(l => l.words)));
-      return core.marginLabelsFromWords(words, strip, H);
-    }));
     // Second chance for numbered strips without options: sparse-text OCR.
     const extraOptionLines = layout.columns.map(() => []);
     await Promise.all(core.optionlessStrips({ map, layout, columnLines, marginLabels }).map(async s => {
@@ -334,7 +373,7 @@ const analyzePage = async (page) => {
       const line = core.instructionFromBand(await ocrRegion(band.x0, band.y0, band.x1, band.y1, 2), band);
       if (line) passageLines[band.col].push(line);
     }
-    regions = core.findQuestions({ map, layout, columnLines, marginLabels, extraOptionLines, passageLines });
+    regions = core.findQuestions({ map, layout, columnLines, marginLabels, extraOptionLines, passageLines, answerSheetGuard: opts.answerSheetGuard, numberingRestarts: opts.numberingRestarts });
   }
 
   let testNumber = core.readTestNumber(headerLines);
@@ -406,11 +445,27 @@ const analyzePage = async (page) => {
     }
   }
 
+  // Printed answers (profiles with `answerKey`), for answers.csv and the
+  // self-check: a few OCR passes over the answer band, merged.
+  let answers;
+  if (opts.answerKey) {
+    const band = core.answerKeyBand(W, H, opts.answerKey);
+    const texts = await Promise.all(core.answerKeyImages(gray, W, H, 1, band, opts.answerKey).map(async ({ width, height, data }) => {
+      const png = await sharp(Buffer.from(data), { raw: { width, height, channels: 1 } }).png().toBuffer();
+      return (await (await getKeyPool()).addJob('recognize', png)).data.text;
+    }));
+    answers = core.parseAnswerKey(texts);
+  }
+
   return {
-    regions, testNumber, pageNumber, pageLabel, ow, oh, fromText,
+    regions, testNumber, pageNumber, pageLabel, ow, oh, fromText, answers,
     section: core.readSection(headerLines),
     week: pageWeek, weekUnsure, weekGlyphs,
     headerTopic: core.readHeaderTopic(headerLines, W),
+    // Profiles naming per test: the first header line that reads as a topic.
+    plainTopic: opts.namesPerTest
+      ? [core.readHeaderTopic(headerLines, W), ...headerLines.map(l => l.text)].map(t => core.plausibleTopic(t, opts.topicIgnore)).find(Boolean)
+      : undefined,
     coverTopic,
   };
 };
@@ -505,11 +560,53 @@ for (const idxs of bySource.values()) {
   idxs.forEach((i, k) => { topics[i] = resolved[k]; });
   const w = core.resolveWeeks(idxs.map(i => ({ ...results[i], isCover: !!results[i].coverTopic })));
   idxs.forEach((i, k) => { weeks[i] = w[k]; });
+  // Profiles naming per test: a test's number and topic come from whichever
+  // of its pages read them (the most common reading wins).
+  if (opts.namesPerTest) {
+    const seg = core.testSegments(idxs.map(i => results[i].regions.map(q => +q.questionNumber)));
+    const byTest = new Map();
+    idxs.forEach((i, k) => { if (!byTest.has(seg[k])) byTest.set(seg[k], []); byTest.get(seg[k]).push(i); });
+    for (const members of byTest.values()) {
+      const testNumber = core.majority(members.map(i => results[i].testNumber));
+      const topic = core.majority(members.map(i => results[i].plainTopic));
+      for (const i of members) { results[i].testNumber = testNumber; topics[i] = topic; }
+    }
+  }
+}
+
+// Printed answers vs crops, per book (profiles with `answerKey`).
+const answerOf = new Map(); // `${pageIndex}:${n}` -> letter
+const checkLines = [];
+if (opts.answerKey) {
+  const books = new Map();
+  pages.forEach((p, i) => { if (results[i]) { const k = p.source ?? p.file; if (!books.has(k)) books.set(k, []); books.get(k).push(i); } });
+  let tests = 0, clean = 0, missingTotal = 0, extraTotal = 0;
+  for (const [book, idxs] of books) {
+    idxs.sort((a, b) => (pages[a].order ?? 0) - (pages[b].order ?? 0));
+    const check = core.checkAnswers(idxs.map(i => ({
+      page: pages[i].pdfPage, questions: results[i].regions.map(q => +q.questionNumber), answers: results[i].answers,
+    })));
+    idxs.forEach((i, k) => results[i].regions.forEach(q => {
+      const letter = check.answerOf(k, +q.questionNumber);
+      if (letter) answerOf.set(`${i}:${q.questionNumber}`, letter);
+    }));
+    for (const t of check.tests) {
+      tests++;
+      const [a, b] = t.pages.map(k => results[idxs[k]].pageLabel);
+      if (!t.missing.length && !t.extra.length) { clean++; continue; }
+      missingTotal += t.missing.length; extraTotal += t.extra.length;
+      checkLines.push(`${path.basename(book)} ${a}${b !== a ? '-' + b : ''}: questions ${t.questions.join(',')}` +
+        `${t.missing.length ? ` | not cropped: ${t.missing.join(',')}` : ''}${t.extra.length ? ` | beyond printed answers: ${t.extra.join(',')}` : ''}` +
+        `${t.answered ? '' : ' | no printed answers read'}`);
+    }
+  }
+  console.log(`Self-check: ${clean}/${tests} tests match their printed answers; ${missingTotal} question(s) not cropped, ${extraTotal} beyond the printed answers (see check.txt)`);
 }
 
 let total = 0;
 const used = new Set();
 const cropJobs = [];
+const csvRows = [];
 for (let i = 0; i < pages.length; i++) {
   const r = results[i];
   if (!r) continue;
@@ -523,6 +620,7 @@ for (let i = 0; i < pages.length; i++) {
     for (let k = 2; used.has(name); k++) name = name.replace(/(_\d+)?\.(jpg|png)$/, `_${k}.$2`);
     used.add(name);
     cropJobs.push(() => cropRegion(pages[i], r.ow, r.oh, region, path.join(outDir, name)));
+    if (opts.answerKey) csvRows.push([name, r.pageLabel, region.questionNumber, answerOf.get(`${i}:${region.questionNumber}`) ?? '']);
     total++;
   }
   if (r.regions.length > 0 || !pages[i].source) {
@@ -543,6 +641,11 @@ await Promise.all(Array.from({ length: Math.max(2, os.cpus().length) }, async ()
   while (nextJob < cropJobs.length) await cropJobs[nextJob++]();
 }));
 
+if (opts.answerKey) {
+  const q = (v) => /[",\n]/.test(String(v)) ? `"${String(v).replace(/"/g, '""')}"` : String(v);
+  await writeFile(path.join(outDir, 'answers.csv'), ['file,page,question,answer', ...csvRows.map(r => r.map(q).join(','))].join('\n') + '\n');
+  await writeFile(path.join(outDir, 'check.txt'), (checkLines.join('\n') || 'All tests match their printed answers.') + '\n');
+}
 console.log(`Done: ${total} crop(s) in ${((Date.now() - t0) / 1000).toFixed(1)}s -> ${outDir}/`);
 if (schedulerPromise) await (await schedulerPromise).terminate();
 if (digitWorkerPromise) await (await digitWorkerPromise).terminate();

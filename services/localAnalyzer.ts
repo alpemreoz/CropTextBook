@@ -1,5 +1,6 @@
 import { createWorker, Worker } from 'tesseract.js';
 import * as core from '../core/qcropCore.mjs';
+import { profileOptions } from '../core/profiles.mjs';
 import { AnalysisResult } from './geminiService';
 import type { PdfTextItem } from './fileLoader';
 
@@ -23,6 +24,10 @@ export interface LocalAnalysis extends AnalysisResult {
   week?: string;
   /** A badge is there but its number may be misread (scans). */
   weekUnsure?: boolean;
+  /** A header line that reads as a topic (profiles naming per test). */
+  plainTopic?: string;
+  /** Answers printed on the page (profiles with `answerKey`). */
+  answers?: { n: number; letter: string }[];
   /** Digit shapes of the badge number, for reading it by shape (scans). */
   weekGlyphs?: { aspect: number; bits: string }[];
   fromTextLayer: boolean;
@@ -63,6 +68,22 @@ const getSparseWorker = makeWorker({ tessedit_pageseg_mode: '11' });
 const getLetterWorker = makeWorker({ tessedit_char_whitelist: 'ABCDE', tessedit_pageseg_mode: '10' });
 // The number of a header week badge ("10." of "10. HAFTA").
 const getWeekWorker = makeWorker({ tessedit_char_whitelist: '0123456789.', tessedit_pageseg_mode: '7' });
+// Printed answer keys ("1.C 2.B"), for profiles that have them.
+const getKeyWorker = makeWorker({ tessedit_char_whitelist: '0123456789.-)/ABCDE ', tessedit_pageseg_mode: '11' });
+
+/** A 1-channel image (core output) as a canvas Tesseract can read. */
+const grayCanvas = ({ width, height, data }: { width: number; height: number; data: Uint8Array }): HTMLCanvasElement => {
+  const c = document.createElement('canvas');
+  c.width = width; c.height = height;
+  const cx = c.getContext('2d')!;
+  const img = cx.createImageData(width, height);
+  for (let i = 0; i < data.length; i++) {
+    img.data[i * 4] = img.data[i * 4 + 1] = img.data[i * 4 + 2] = data[i];
+    img.data[i * 4 + 3] = 255;
+  }
+  cx.putImageData(img, 0, 0);
+  return c;
+};
 
 /** Copy of `src` blurred at 1:1 scale. Canvas `filter: blur()` is applied to
  * the source *before* scaling, so blurring must happen in a separate pass
@@ -81,12 +102,14 @@ const blurCanvas = (src: HTMLCanvasElement, blur: number): HTMLCanvasElement => 
 /**
  * `bookPage`: the page belongs to a book (a PDF, or a numbered image
  * sequence), so a page without questions is checked for a unit cover topic.
+ * `profile`: a book profile name (core/profiles.mjs), '' for the defaults.
  */
 export const analyzeTestPageLocal = async (
   img: HTMLImageElement,
   textItems?: PdfTextItem[],
-  { bookPage = false }: { bookPage?: boolean } = {},
+  { bookPage = false, profile = '' }: { bookPage?: boolean; profile?: string } = {},
 ): Promise<LocalAnalysis> => {
+  const opts = profileOptions(profile);
   const scale = Math.min(1, core.ANALYSIS_WIDTH / img.width);
   const W = Math.round(img.width * scale);
   const H = Math.round(img.height * scale);
@@ -101,7 +124,7 @@ export const analyzeTestPageLocal = async (
 
   const fromText = core.textLayerUsable(textItems);
   const words: Word[] = fromText ? core.wordsFromTextItems(textItems, W, H) : [];
-  const layout = core.detectLayout(map, core.labelBoxesFromWords(words));
+  const layout = core.detectLayout(map, core.labelBoxesFromWords(words), opts);
 
   // OCR one region of the page in isolation (columns would otherwise merge
   // into single lines spanning the whole page) and offset boxes back into
@@ -135,6 +158,7 @@ export const analyzeTestPageLocal = async (
   };
 
   let headerLines: Line[], footerLines: Line[], columnLines: Line[][], allLines: Line[] = [];
+  let marginLabels: any[] = [];
   if (fromText) {
     headerLines = core.linesInRegion(words, 0, 0, W, layout.contentTop);
     footerLines = core.linesInRegion(words, 0, layout.footerTop, W, H);
@@ -142,6 +166,46 @@ export const analyzeTestPageLocal = async (
       core.linesInRegion(words, c.x0 - 5, layout.contentTop, c.x1 + 5, layout.contentBottom));
     allLines = core.groupLines(words);
   } else {
+    // Question numbers read on their own from each column's margin (from
+    // near the page top when the profile says the first questions may sit
+    // where a header would be).
+    const readMargins = async (lay: any) => {
+      const stripLayout = opts.headerFromLabels ? { ...lay, contentTop: Math.round(H * 0.015) } : lay;
+      const out: any[] = [];
+      for (let ci = 0; ci < lay.columns.length; ci++) {
+        const strip = core.marginStrip(map, stripLayout, null, ci, { dropTall: opts.headerFromLabels });
+        if (!strip) { out.push([]); continue; }
+        const c = grayCanvas({ width: strip.width, height: strip.height, data: strip.gray });
+        const { data } = await (await getLabelWorker()).recognize(c, {}, { blocks: true });
+        const labelWords: any[] = (data.blocks ?? []).flatMap(b => b.paragraphs.flatMap(p => p.lines.flatMap(l => l.words)));
+        const labelOpts = { edgeTolerance: opts.headerFromLabels ? 0.02 : undefined };
+        if (opts.headerFromLabels) {
+          // Numbers the whole-strip read missed, read one blob at a time.
+          const read = core.marginLabelsFromWords(labelWords, strip, H, labelOpts).map((m: any) => (m.bbox.y0 - strip.y0) * 2 + strip.pad);
+          for (const blob of core.marginStripBlobs(strip, H)) {
+            if (read.some((y: number) => y >= blob.y0 - 4 && y <= blob.y1)) continue;
+            const r = await (await getWeekWorker()).recognize(grayCanvas(blob.image), {}, { blocks: true });
+            for (const w of (r.data.blocks ?? []).flatMap(b => b.paragraphs.flatMap(p => p.lines.flatMap(l => l.words)))) {
+              labelWords.push({ ...w, bbox: { ...w.bbox, y0: w.bbox.y0 + blob.y0, y1: w.bbox.y1 + blob.y0 } });
+            }
+          }
+        }
+        out.push(core.marginLabelsFromWords(labelWords, strip, H, labelOpts));
+      }
+      return out;
+    };
+    marginLabels = await readMargins(layout);
+    // A column without a single number: the split may have cut its numbers
+    // off (a logo or dotted rule in the gutter). The other split strategy
+    // wins if it finds more numbers.
+    if (opts.headerFromLabels && marginLabels.some((m: any[]) => m.length === 0)) {
+      const alt = core.detectLayout(map, core.labelBoxesFromWords(words), { ...opts, leftmostGutter: !opts.leftmostGutter });
+      if (alt.columns[0].x1 !== layout.columns[0].x1) {
+        const altLabels = await readMargins(alt);
+        if (altLabels.flat().length > marginLabels.flat().length) { layout.columns = alt.columns; marginLabels = altLabels; }
+      }
+    }
+    if (opts.headerFromLabels) layout.contentTop = core.contentTopFromLabels(layout, marginLabels, H);
     [headerLines, footerLines, ...columnLines] = await Promise.all([
       ocrRegion(0, 0, W, layout.contentTop, 2),
       // Footer page numbers use a seven-segment style font; blur merges the
@@ -175,24 +239,6 @@ export const analyzeTestPageLocal = async (
     if (pending.length) await readShapeLetters(pending, core.capHeightFromStrips(pending, H, true), extraOptionLines);
     regions = core.findQuestions({ ...params, extraOptionLines });
   } else {
-    // Question numbers read on their own from each column's margin.
-    const marginLabels = [];
-    for (let ci = 0; ci < layout.columns.length; ci++) {
-      const strip = core.marginStrip(map, layout, columnLines, ci);
-      if (!strip) { marginLabels.push([]); continue; }
-      const c = document.createElement('canvas');
-      c.width = strip.width; c.height = strip.height;
-      const sctx = c.getContext('2d')!;
-      const rgba = sctx.createImageData(strip.width, strip.height);
-      for (let i = 0; i < strip.gray.length; i++) {
-        rgba.data[i * 4] = rgba.data[i * 4 + 1] = rgba.data[i * 4 + 2] = strip.gray[i];
-        rgba.data[i * 4 + 3] = 255;
-      }
-      sctx.putImageData(rgba, 0, 0);
-      const { data } = await (await getLabelWorker()).recognize(c, {}, { blocks: true });
-      const labelWords = (data.blocks ?? []).flatMap(b => b.paragraphs.flatMap(p => p.lines.flatMap(l => l.words)));
-      marginLabels.push(core.marginLabelsFromWords(labelWords, strip, H));
-    }
     // Second chance for numbered strips without options: sparse-text OCR.
     const extraOptionLines: Line[][] = layout.columns.map(() => []);
     for (const s of core.optionlessStrips({ map, layout, columnLines, marginLabels })) {
@@ -209,7 +255,10 @@ export const analyzeTestPageLocal = async (
       const line = core.instructionFromBand(await ocrRegion(band.x0, band.y0, band.x1, band.y1, 2), band);
       if (line) passageLines[band.col].push(line);
     }
-    regions = core.findQuestions({ map, layout, columnLines, marginLabels, extraOptionLines, passageLines });
+    regions = core.findQuestions({
+      map, layout, columnLines, marginLabels, extraOptionLines, passageLines,
+      answerSheetGuard: opts.answerSheetGuard, numberingRestarts: opts.numberingRestarts,
+    });
   }
 
   let testNumber: string | undefined = core.readTestNumber(headerLines);
@@ -291,12 +340,29 @@ export const analyzeTestPageLocal = async (
     }
   }
 
+  // Printed answers (profiles with `answerKey`), for answers.csv and the
+  // self-check: a few OCR passes over the answer band, merged.
+  let answers: { n: number; letter: string }[] | undefined;
+  if (opts.answerKey) {
+    const band = core.answerKeyBand(W, H, opts.answerKey);
+    const texts: string[] = [];
+    for (const pass of core.answerKeyImages(rgba, W, H, 4, band, opts.answerKey)) {
+      texts.push((await (await getKeyWorker()).recognize(grayCanvas(pass))).data.text);
+    }
+    answers = core.parseAnswerKey(texts);
+  }
+
   return {
+    answers,
     pageNumber: core.readPageNumber(footerLines, W) ?? 'unknown',
     testNumber,
     topic: section ?? headerTopic,
     section,
     headerTopic,
+    // Profiles naming per test: the first header line that reads as a topic.
+    plainTopic: opts.namesPerTest
+      ? [headerTopic, ...headerLines.map(l => l.text)].map(t => core.plausibleTopic(t, opts.topicIgnore)).find(Boolean)
+      : undefined,
     coverTopic,
     week,
     weekUnsure,

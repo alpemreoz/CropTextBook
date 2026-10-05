@@ -28,3 +28,6 @@ q-crop-out
 *.njsproj
 *.sln
 *.sw?
+
+# Local test harness (debug overlays, sample scoring)
+.qcrop-test/
