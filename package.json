@@ -8,7 +8,8 @@
     "build": "vite build",
     "preview": "vite preview",
     "cli": "node cli/qcrop.mjs",
-    "logs": "node scripts/summarize-logs.mjs"
+    "logs": "node scripts/summarize-logs.mjs",
+    "rename": "node cli/qcrop-rename.mjs"
   },
   "dependencies": {
     "@google/genai": "^1.40.0",

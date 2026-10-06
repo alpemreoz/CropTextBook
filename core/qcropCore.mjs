@@ -2510,14 +2510,199 @@ export const markedAnswer = (region, marks, W, H) => {
 
 /**
  * Header of a test page that prints its number beside the topic
- * ("1   Metni Görsellerle Yorumlama") -> { testNumber, topic } or {}.
+ * ("1   Metni Görsellerle Yorumlama", "4 Bir Peygamber Tanıyorum: Hz. Musa
+ * (a.s.)", "10 ON THE PHONE") -> { testNumber, topic } or {}. The topic is
+ * the rest of the line: mostly letters, with a real word in it.
  */
 export const readNumberedTitle = (headerLines) => {
   for (const line of headerLines) {
-    const m = /^(\d{1,3})\s+(\p{L}[\p{L}\s,'’\-–]+)$/u.exec(line.text.replace(/\s+/g, ' ').trim());
-    if (m && plausibleTopic(m[2])) return { testNumber: m[1].padStart(2, '0'), topic: m[2].trim() };
+    const m = /^(\d{1,3})\s+(\p{L}.*)$/u.exec(line.text.replace(/\s+/g, ' ').trim());
+    if (!m) continue;
+    const topic = m[2].trim();
+    const letters = (topic.match(/\p{L}/gu) ?? []).length;
+    if (letters >= 4 && letters / topic.replace(/\s/g, '').length >= 0.6 && /\p{L}{3,}/u.test(topic)) {
+      return { testNumber: m[1].padStart(2, '0'), topic };
+    }
   }
   return {};
+};
+
+// ---------------------------------------------------------------------------
+// Any book's table of contents (cli/qcrop-rename.mjs): read from a contents
+// page's words (text layer or OCR), or from a contents.txt the user edits,
+// and matched to crops by page.
+// ---------------------------------------------------------------------------
+
+/**
+ * Words of a contents page -> its pieces of text in reading order. Rows are
+ * cut where a wide gap separates columns; a piece that is only a number
+ * (a page number set far right) stays with the piece left of it. Columns
+ * are read one after another, top to bottom.
+ */
+export const contentsPieces = (words, W) => {
+  const pieces = [];
+  for (const row of groupLines(words)) {
+    const hs = row.words.map(w => w.bbox.y1 - w.bbox.y0).sort((a, b) => a - b);
+    const h = hs[hs.length >> 1] || 10;
+    const parts = [];
+    for (const w of row.words) {
+      const last = parts[parts.length - 1];
+      if (last && w.bbox.x0 - last.x1 <= h * 2.5) { last.words.push(w); last.x1 = w.bbox.x1; }
+      else parts.push({ words: [w], x0: w.bbox.x0, x1: w.bbox.x1, y: row.bbox.y0 });
+    }
+    for (const part of parts) {
+      const text = part.words.map(w => w.text).join(' ').trim();
+      const prev = pieces[pieces.length - 1];
+      if (/^\d{1,3}$/.test(text) && prev && prev.y === part.y) { prev.text += ` ${text}`; prev.x1 = part.x1; continue; }
+      pieces.push({ text, x0: part.x0, x1: part.x1, y: part.y });
+    }
+  }
+  // Columns: left edges more than an eighth of the page apart.
+  const xs = [...new Set(pieces.map(p => Math.round(p.x0)))].sort((a, b) => a - b);
+  const starts = xs.filter((x, i) => i === 0 || x - xs[i - 1] > W * 0.12);
+  const colOf = (p) => starts.filter(x => x <= p.x0 + 1).length - 1;
+  return pieces.sort((a, b) => colOf(a) - colOf(b) || a.y - b.y).map(p => p.text);
+};
+
+/**
+ * Pieces of contents text -> items: { heading } (a unit or chapter line,
+ * no page number), { title, page } (a test or topic and the printed page
+ * it starts on) and { orphan } (a line whose page number wasn't read). Dot leaders, bullets and "İçindekiler" are dropped;
+ * headings in a row (a chapter's number and its name) are joined.
+ */
+export const contentsItems = (pieces) => {
+  const items = [];
+  for (const raw of pieces) {
+    const text = raw
+      .replace(/[.·…_]{3,}/g, ' ').replace(/\s+:\s*\.?\s*(?=\d+$)/, ' ')
+      .replace(/^[n•▪●■◆\-–—*]\s+/u, '').replace(/\s+/g, ' ').trim();
+    if (!text || /i̇?çindekiler|içindekiler|contents/i.test(text.toLocaleLowerCase('tr'))) continue;
+    const letters = (text.match(/\p{L}/gu) ?? []).length;
+    const m = /^(.*\p{L}.*?)[\s.:·…_\-–—]*?\s(\d{1,3})$/u.exec(text);
+    if (m && letters >= 2) {
+      items.push({ title: m[1].replace(/[\s.:·…_\-–—]+$/u, '').trim(), page: +m[2] });
+    } else if (letters >= 4 && text.length <= 80) {
+      // A heading is set in capitals or names a unit or chapter; any other
+      // line without a page is an entry whose number was lost (kept aside
+      // for the user to complete).
+      const caps = (text.match(/\p{Lu}/gu) ?? []).length;
+      const isHeading = /bölüm|ünite|unit|chapter|kısım|konu|hafta/i.test(text.toLocaleLowerCase('tr')) ||
+        (caps / letters >= 0.6 && letters >= 8 && /\s/.test(text));
+      const last = items[items.length - 1];
+      if (!isHeading) items.push({ orphan: text });
+      else if (last?.heading !== undefined) last.heading = `${last.heading} ${text}`;
+      else items.push({ heading: text });
+    }
+  }
+  return items;
+};
+
+/** A page that reads as contents: many titled entries, pages mostly rising. */
+export const looksLikeContents = (items, pageText = '') => {
+  const entries = items.filter(it => it.page !== undefined);
+  if (entries.length < 5) return false;
+  let up = 0;
+  for (let i = 1; i < entries.length; i++) if (entries[i].page >= entries[i - 1].page) up++;
+  return up / (entries.length - 1) >= 0.6 && (entries.length >= 8 || /i̇?çindekiler|içindekiler|contents/i.test(pageText.toLocaleLowerCase('tr')));
+};
+
+/** Items -> the editable contents.txt (see parseContentsFile). */
+export const contentsFileText = (items, { book = '', source = '' } = {}) => [
+  `# Q-Crop contents${book ? ` of ${book}` : ''}${source ? ` (${source})` : ''}`,
+  '# Check this list, fix what is wrong, then run the rename again: it uses this file.',
+  '#   <page> ; <title>   one line per test or topic, page as printed in the book',
+  '#   a line without a page number is a heading (unit, chapter) for the lines under it',
+  '#   offset = auto      or a number: PDF page = printed page + offset',
+  '#   lines starting with # are ignored',
+  'offset = auto',
+  '',
+  ...items.map(it => it.page !== undefined ? `${it.page} ; ${it.title}`
+    : it.orphan !== undefined ? `# ? ${it.orphan}      <- no page number read; add one (and remove "# ?") if this is an entry`
+    : `\n${it.heading}`),
+  '',
+].join('\n');
+
+/** contents.txt -> { items, offset } (offset null = find it from the crops). */
+export const parseContentsFile = (text) => {
+  const items = [];
+  let offset = null;
+  for (const raw of text.split(/\r?\n/)) {
+    const line = raw.trim();
+    if (!line || line.startsWith('#')) continue;
+    const o = /^offset\s*=\s*(auto|-?\d+)$/i.exec(line);
+    if (o) { offset = o[1].toLowerCase() === 'auto' ? null : +o[1]; continue; }
+    const m = /^(\d{1,4})\s*[;\t,|]\s*(.+)$/.exec(line);
+    if (m) items.push({ page: +m[1], title: m[2].trim() });
+    else items.push({ heading: line });
+  }
+  return { items, offset };
+};
+
+/**
+ * Contents items matched to the book's pages. `testStarts`: pages (as the
+ * crops number them) where a question 1 was cropped, i.e. where tests
+ * start. The printed-to-page offset is the one that puts the most entries
+ * on such pages (unless given), then each entry may move up to three pages
+ * to the nearest test start, in order (contents can be off by a page or
+ * two). -> { entries: [{ name, start }], offset }, entries in page order.
+ */
+export const alignContents = (items, testStarts, offset = null) => {
+  const entries = [];
+  let heading;
+  for (const it of items) {
+    if (it.heading !== undefined) { heading = it.heading; continue; }
+    if (it.page === undefined) continue;
+    entries.push({ name: [heading, it.title].filter(Boolean).join(' '), page: it.page });
+  }
+  const S = [...new Set(testStarts)].sort((a, b) => a - b);
+  const has = new Set(S);
+  if (offset === null) {
+    let best = 0, bestFit = -1;
+    for (let k = -10; k <= 60; k++) {
+      const fit = entries.filter(e => has.has(e.page + k)).length;
+      if (fit > bestFit || (fit === bestFit && Math.abs(k) < Math.abs(best))) { best = k; bestFit = fit; }
+    }
+    offset = best;
+  }
+  const E = entries.map(e => e.page + offset);
+  // Order-keeping alignment of entries to test starts (each within 3 pages).
+  const cost = Array.from({ length: E.length + 1 }, () => new Float64Array(S.length + 1).fill(Infinity));
+  const back = Array.from({ length: E.length + 1 }, () => new Int8Array(S.length + 1));
+  cost[0][0] = 0;
+  for (let i = 0; i <= E.length; i++) {
+    for (let j = 0; j <= S.length; j++) {
+      if (i && cost[i - 1][j] + 2.5 < cost[i][j]) { cost[i][j] = cost[i - 1][j] + 2.5; back[i][j] = 1; }
+      if (j && cost[i][j - 1] + 1 < cost[i][j]) { cost[i][j] = cost[i][j - 1] + 1; back[i][j] = 2; }
+      const d = i && j ? Math.abs(S[j - 1] - E[i - 1]) : Infinity;
+      if (d <= 3 && cost[i - 1][j - 1] + d < cost[i][j]) { cost[i][j] = cost[i - 1][j - 1] + d; back[i][j] = 3; }
+    }
+  }
+  const start = [...E];
+  for (let i = E.length, j = S.length; i > 0 || j > 0;) {
+    const b = back[i][j];
+    if (b === 3) { start[i - 1] = S[j - 1]; i--; j--; } else if (b === 1) i--; else j--;
+  }
+  // An entry no test start confirms, whose page breaks the order of the
+  // contents (a misread "83" between 31 and 35), is left out.
+  const matched = start.map((st, i) => S.includes(st) && Math.abs(st - E[i]) <= 3);
+  const dropped = [];
+  const kept = entries.map((e, i) => ({ name: e.name, start: start[i], page: e.page, i })).filter(e => {
+    if (matched[e.i]) return true;
+    const prev = start.slice(0, e.i).filter((_, k) => matched[k]).pop();
+    const next = start.slice(e.i + 1).find((_, k) => matched[e.i + 1 + k]);
+    const ok = (prev === undefined || e.start >= prev) && (next === undefined || e.start <= next);
+    if (!ok) dropped.push({ name: e.name, page: e.page });
+    return ok;
+  });
+  const out = kept.map(e => ({ name: e.name, start: e.start })).sort((a, b) => a.start - b.start);
+  return { entries: out, offset, dropped };
+};
+
+/** The contents entry a page belongs to (the last one starting at or before it). */
+export const contentsEntryAt = (entries, page) => {
+  let found = null;
+  for (const e of entries) if (e.start <= page) found = e;
+  return found;
 };
 
 // ---------------------------------------------------------------------------

@@ -508,7 +508,8 @@ const analyzePage = async (page) => {
     headerTopic: core.readHeaderTopic(headerLines, W),
     // Profiles naming per test: the first header line that reads as a topic.
     plainTopic: opts.namesPerTest
-      ? [title.topic, core.readHeaderTopic(headerLines, W), ...headerLines.map(l => l.text)].map(t => core.plausibleTopic(t, opts.topicIgnore)).find(Boolean)
+      // (A header title read with its test number is used as printed.)
+      ? title.topic ?? [core.readHeaderTopic(headerLines, W), ...headerLines.map(l => l.text)].map(t => core.plausibleTopic(t, opts.topicIgnore)).find(Boolean)
       : undefined,
     coverTopic,
   };

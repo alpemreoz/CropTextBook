@@ -173,6 +173,42 @@ OCR, then shape-based "A)" detection). When a PDF with real text exists,
 it's still the better input: exact, faster, and sharper crops (vector
 rendering instead of the image's fixed pixels).
 
+## Renaming crops from the table of contents
+
+Topics and test names read from page headers can come out wrong (stylized
+banners, scans). Most books list every test or topic with its start page
+in their table of contents (İçindekiler), so a crop folder can be renamed
+after it: each crop gets the name of the entry its page falls under (an
+entry runs until the page before the next one starts).
+
+```bash
+npm run rename -- <crop folder> --book <the book's PDF or page-image folder>
+# e.g.
+npm run rename -- apotemi_crops --book ~/Downloads/demo_books/20261003171555338.pdf
+```
+
+- The contents page is found in the first pages of the book and read from
+  the text layer, or with OCR for scans; `--contents-pages 2-4` says where
+  it is.
+- What was read is saved as `contents.txt` in the crop folder, one line per
+  entry: `<printed page> ; <title>`. A line without a page is a heading
+  (unit, chapter) put in front of the entries under it, and `# ?` marks a
+  line whose page number couldn't be read. Contents pages of scanned books
+  are often too decorative for OCR: check the file, fix it (or type the
+  contents yourself, it's 10–30 lines) and run the command again — a
+  `contents.txt` in the folder is used instead of reading the book
+  (`--reread` reads the book again).
+- Printed page numbers are matched to the pages in the crop names
+  automatically (from the footers of a text-layer PDF, else from the pages
+  where question 1 was cropped; contents that are a page or two off are
+  corrected the same way). `offset = 4` in `contents.txt` or `--offset 4`
+  sets it by hand (PDF page = printed page + 4).
+- `--dry-run` shows the new names without renaming. `answers.csv` is
+  updated to the new names, and `--undo` puts the previous names back.
+
+One book per crop folder. Example names: `1_bölüm_gerçek_sayılar_test2_q1_s15.jpg`,
+`bölüm_6_çarpanlara_ayırma_denklem_çözme_q3_s146.jpg`.
+
 ## Book profiles (scanned question banks)
 
 Some books need settings the default analysis doesn't use: scanned question
