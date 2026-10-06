@@ -6,6 +6,7 @@ import { cropFileName, resolveTopics, resolveWeeks, imageSequence, cropRect, mas
 import { PROFILES, profileOptions } from './core/profiles.mjs';
 import { QuestionRegion, AppStatus, BoundingBox, PageData } from './types';
 import { LoaderIcon, DownloadIcon, ScissorsIcon, TrashIcon, PlusIcon, ChevronLeftIcon, ChevronRightIcon } from './components/Icons';
+import { logEvent, logSessionStart, roundBox, edgeDelta, sameBox } from './services/editLog';
 
 type ResizeHandle = 'nw' | 'n' | 'ne' | 'e' | 'se' | 's' | 'sw' | 'w';
 
@@ -33,6 +34,20 @@ const bookOf = (p: PageData): { key: string; order: number } | null => {
 
 const boxKey = (b?: BoundingBox) => b ? `${b.xmin},${b.ymin},${b.xmax},${b.ymax}` : '';
 
+// --- Edit log (services/editLog.ts) ------------------------------------------
+
+/** Which page an entry is about: the PDF and its page index, or the image file. */
+const pageInfo = (p: PageData) => ({
+  book: p.pdf ? p.pdf.source : (imageSequence(p.file.name)?.key ?? p.file.name),
+  page: p.pdf ? p.pdf.pageIndex : p.file.name,
+  pageLabel: p.pageLabel ?? p.pageNumber,
+});
+
+const regionInfo = (r: QuestionRegion) => ({
+  rid: r.id, n: r.questionNumber, box: roundBox(r.box),
+  ...(r.contextBox && { passage: roundBox(r.contextBox) }),
+});
+
 /** Questions in reading order: left column top to bottom, then the right one. */
 const readingOrder = (a: BoundingBox, b: BoundingBox) => {
   const col = (x: BoundingBox) => ((x.xmin + x.xmax) / 2 < 500 ? 0 : 1);
@@ -51,6 +66,10 @@ export default function App() {
   const [isProcessing, setIsProcessing] = useState(false);
   
   const canvasRef = useRef<HTMLCanvasElement>(null);
+  // Edit log: what detection produced per region (to tell corrections of
+  // detected boxes from boxes drawn by hand), and pages edited since.
+  const detectedRef = useRef(new Map<string, { box: BoundingBox; n: string; passage?: BoundingBox }>());
+  const editedPagesRef = useRef(new Set<string>());
   const containerRef = useRef<HTMLDivElement>(null);
   const [containerSize, setContainerSize] = useState({ w: 0, h: 0 });
   const [tool, setTool] = useState<Tool>('select');
@@ -123,6 +142,31 @@ export default function App() {
   }, [pages.length > 0]);
 
   const generateId = () => Math.random().toString(36).substr(2, 9);
+
+  // Edit log: the session, and how long each page was looked at (a page
+  // reviewed without changes is a page the detection got right).
+  useEffect(() => {
+    logSessionStart({ profile, screen: `${window.screen.width}x${window.screen.height}`, userAgent: navigator.userAgent });
+  }, []);
+  const pagesRef = useRef<PageData[]>([]);
+  useEffect(() => { pagesRef.current = pages; }, [pages]);
+  useEffect(() => {
+    if (!activePageId) return;
+    const since = Date.now();
+    return () => {
+      const p = pagesRef.current.find(x => x.id === activePageId);
+      const ms = Date.now() - since;
+      if (p && p.status === 'READY' && ms >= 1000) {
+        logEvent('page_viewed', { ...pageInfo(p), profile, ms, questions: p.regions.length, edited: editedPagesRef.current.has(p.id) });
+      }
+    };
+  }, [activePageId]);
+
+  /** Logs a correction on a page and marks the page as edited. */
+  const logEdit = (event: string, page: PageData, data: Record<string, unknown>) => {
+    editedPagesRef.current.add(page.id);
+    logEvent(event, { ...pageInfo(page), profile, ...data });
+  };
 
   const activePage = useMemo(() =>
     pages.find(p => p.id === activePageId), [pages, activePageId]
@@ -303,6 +347,7 @@ export default function App() {
     }));
 
     setPages(prev => [...prev, ...newPages]);
+    logEvent('files_added', { profile, files: [...new Set(newFiles.map(f => f.file.name))], pages: newFiles.length });
     if (!activePageId) setActivePageId(newPages[0].id);
     setIsProcessing(true);
   }, [activePageId]);
@@ -342,6 +387,7 @@ export default function App() {
   }, [pages, isProcessing]);
 
   async function processPage(pendingPage: PageData) {
+    const started = performance.now();
     try {
       let dataUrl = pendingPage.dataUrl;
       let textItems;
@@ -390,6 +436,16 @@ export default function App() {
         croppedDataUrl: cropImage(img, r.box, r.contextBox, r.mask)
       }));
 
+      // Edit log: what the program found, the baseline for any correction.
+      for (const r of regionsWithData) detectedRef.current.set(r.id, { box: r.box, n: r.questionNumber, passage: r.contextBox });
+      editedPagesRef.current.delete(pendingPage.id);
+      logEvent('page_analyzed', {
+        ...pageInfo({ ...pendingPage, pageLabel, pageNumber }), profile,
+        ms: Math.round(performance.now() - started),
+        width: img.width, height: img.height, textLayer: result.fromTextLayer,
+        regions: regionsWithData.map(regionInfo),
+      });
+
       inFlight.current.delete(pendingPage.id);
       setPages(prev => prev.map(p => p.id === pendingPage.id ? {
         ...p,
@@ -412,6 +468,7 @@ export default function App() {
         regions: regionsWithData
       } : p));
     } catch (err: any) {
+      logEvent('page_failed', { ...pageInfo(pendingPage), profile, error: String(err?.message ?? err) });
       inFlight.current.delete(pendingPage.id);
       setPages(prev => prev.map(p => p.id === pendingPage.id ? {
         ...p,
@@ -596,18 +653,25 @@ export default function App() {
   /** Uses (or stops using) the selected passage for one question. */
   const togglePassageFor = (regionId: string, on: boolean) => {
     if (!selectedPassage || !activePageId) return;
+    const r = activePage?.regions.find(x => x.id === regionId);
+    if (activePage && r) logEdit(on ? 'passage_attached' : 'passage_detached', activePage, { rid: r.id, n: r.questionNumber, passage: roundBox(selectedPassage) });
     editRegions(activePageId, r => r.id !== regionId ? r : { ...r, contextBox: on ? selectedPassage : undefined });
   };
 
   const deleteSelectedPassage = () => {
     if (!selectedPassage || !activePageId) return;
     const key = boxKey(selectedPassage);
+    if (activePage) logEdit('passage_deleted', activePage, {
+      passage: roundBox(selectedPassage), usedBy: activePage.regions.filter(r => boxKey(r.contextBox) === key).map(r => r.questionNumber),
+    });
     editRegions(activePageId, r => boxKey(r.contextBox) === key ? { ...r, contextBox: undefined } : r);
     setSelectedPassage(null);
   };
 
   // Detection can attach the wrong passage; this drops it from the crop.
   const handleRemovePassage = (regionId: string, pageId: string) => {
+    const page = pages.find(p => p.id === pageId), r = page?.regions.find(x => x.id === regionId);
+    if (page && r) logEdit('passage_detached', page, { rid: r.id, n: r.questionNumber, passage: roundBox(r.contextBox) });
     editRegions(pageId, r => r.id !== regionId ? r : { ...r, contextBox: undefined });
   };
 
@@ -617,6 +681,10 @@ export default function App() {
     const n = value.replace(/\D/g, '').replace(/^0+(?=\d)/, '');
     setEditingNumberId(null);
     if (!n) return;
+    const page = pages.find(p => p.id === pageId), r = page?.regions.find(x => x.id === regionId);
+    if (page && r && r.questionNumber !== n) {
+      logEdit('number_changed', page, { rid: r.id, from: r.questionNumber, to: n, box: roundBox(r.box), detected: detectedRef.current.has(r.id) });
+    }
     setPages(prev => prev.map(p => p.id !== pageId ? p : {
       ...p, regions: p.regions.map(r => r.id === regionId ? { ...r, questionNumber: n } : r),
     }));
@@ -643,6 +711,8 @@ export default function App() {
   };
 
   const handleDeleteRegion = (regionId: string, pageId: string) => {
+    const page = pages.find(p => p.id === pageId), r = page?.regions.find(x => x.id === regionId);
+    if (page && r) logEdit('box_deleted', page, { ...regionInfo(r), detected: detectedRef.current.has(r.id) });
     setPages(prev => prev.map(p => p.id !== pageId ? p : {
       ...p, regions: p.regions.filter(r => r.id !== regionId)
     }));
@@ -759,6 +829,7 @@ export default function App() {
         // reading order uses it from the start (the rest are ticked by hand).
         setSelectedPassage(box);
         const first = [...activePage.regions].sort((x, y) => readingOrder(x.box, y.box)).find(r => readingOrder(r.box, box) > 0);
+        logEdit('passage_added', activePage, { passage: box, ...(first && { usedBy: [first.questionNumber] }) });
         editRegions(activePage.id, r => r.id === first?.id ? { ...r, contextBox: box, isSelected: false } : r.isSelected ? { ...r, isSelected: false } : r);
         return;
       }
@@ -777,11 +848,32 @@ export default function App() {
       setPages(prev => prev.map(p => p.id !== activePage.id ? p : {
         ...p, regions: [...p.regions.map(r => ({ ...r, isSelected: false })), newRegion]
       }));
+      logEdit('box_added', activePage, regionInfo(newRegion));
     } else if (drag.mode === 'move-passage' || drag.mode === 'resize-passage') {
       const key = boxKey(drag.cur);
       editRegions(activePage.id, r => boxKey(r.contextBox) === key ? { ...r } : r);
+      if (!sameBox(drag.origBox, drag.cur)) {
+        logEdit(drag.mode === 'move-passage' ? 'passage_moved' : 'passage_resized', activePage, {
+          ...(drag.mode === 'resize-passage' && { handle: drag.handle }),
+          from: roundBox(drag.origBox), to: roundBox(drag.cur), edges: edgeDelta(drag.origBox, drag.cur),
+          usedBy: activePage.regions.filter(r => boxKey(r.contextBox) === key).map(r => r.questionNumber),
+        });
+      }
     } else {
       refreshCrop(drag.regionId);
+      // A click that only selected the box changes nothing.
+      const r = activePage.regions.find(x => x.id === drag.regionId);
+      if (r && !sameBox(drag.origBox, r.box)) {
+        const original = detectedRef.current.get(r.id);
+        logEdit(drag.mode === 'move' ? 'box_moved' : 'box_resized', activePage, {
+          rid: r.id, n: r.questionNumber,
+          ...(drag.mode === 'resize' && { handle: drag.handle }),
+          from: roundBox(drag.origBox), to: roundBox(r.box), edges: edgeDelta(drag.origBox, r.box),
+          detected: !!original,
+          // Change against what the program found (after several drags).
+          ...(original && { detectedBox: roundBox(original.box), fromDetected: edgeDelta(original.box, r.box) }),
+        });
+      }
     }
   };
 
@@ -822,6 +914,7 @@ export default function App() {
     const page = pages.find(p => p.id === pageId);
     const blob = page && await exportBlob(region, page);
     if (blob) saveBlob(blob, cropFilename(region, pageId));
+    if (page) logEvent('crop_downloaded', { ...pageInfo(page), profile, ...regionInfo(region), file: cropFilename(region, pageId) });
   };
 
   const cropFilename = (region: QuestionRegion, pageId: string) => cropFileName({
@@ -859,6 +952,16 @@ export default function App() {
       }
       setExportProgress('Zipping…');
       saveBlob(await zip.generateAsync({ type: 'blob' }), 'q-crop-export.zip');
+      // Edit log: every page's final crops, the "right answer" to compare
+      // the detection with (edited: the user changed something on it).
+      logEvent('export', { profile, crops: jobs.length, pages: pages.length, editedPages: pages.filter(p => editedPagesRef.current.has(p.id)).length });
+      for (const page of pages) {
+        if (page.status !== 'READY') continue;
+        logEvent('page_final', {
+          ...pageInfo(page), profile, edited: editedPagesRef.current.has(page.id),
+          regions: page.regions.map(r => ({ ...regionInfo(r), detected: detectedRef.current.has(r.id), file: names[jobs.findIndex(j => j.region.id === r.id)] })),
+        });
+      }
     } finally {
       setExportProgress(null);
     }
@@ -894,6 +997,7 @@ export default function App() {
               onChange={e => {
                 const next = e.target.value;
                 if (pages.length > 0 && !window.confirm('Analyze all pages again with this profile? Boxes you changed by hand will be lost.')) return;
+                logEvent('profile_changed', { from: profile, to: next, pages: pages.length });
                 setProfile(next);
                 if (pages.length > 0) {
                   setPages(prev => prev.map(p => ({ ...p, status: 'IDLE', regions: [] })));
@@ -908,7 +1012,7 @@ export default function App() {
             </select>
           </label>
           {pages.length > 0 && (
-            <button onClick={() => {setPages([]); setActivePageId(null);}} className="px-5 py-2.5 text-sm font-black text-slate-600 hover:text-red-600 bg-slate-100 hover:bg-red-50 rounded-xl transition-all uppercase tracking-widest">
+            <button onClick={() => { logEvent('reset', { profile, pages: pages.length }); setPages([]); setActivePageId(null); }} className="px-5 py-2.5 text-sm font-black text-slate-600 hover:text-red-600 bg-slate-100 hover:bg-red-50 rounded-xl transition-all uppercase tracking-widest">
               Reset App
             </button>
           )}
@@ -1065,6 +1169,9 @@ export default function App() {
                   {exportProgress ? <LoaderIcon className="w-5 h-5 animate-spin" /> : <DownloadIcon className="w-5 h-5" />}
                   {exportProgress ? `Exporting ${exportProgress}` : 'Export All (Auto-Named)'}
                 </button>
+                <p className="text-[10px] text-slate-400 font-semibold mt-3 text-center" title="What the program found and how you corrected it is saved to the logs folder of this project, on this computer. It helps improve the automatic detection.">
+                  Your corrections are saved to <span className="font-mono">logs/</span> on this computer to improve Q-Crop.
+                </p>
               </div>
 
                 {activePage?.status === 'READY' && selectedPassage && (

@@ -71,6 +71,45 @@ is processing: browsers pause PDF page rendering in background tabs.
   the previous/next page; picking a page on the left scrolls the crop list
   to that page; clicking a box on the page scrolls to its crop.
 
+## Edit log (training data)
+
+The web app records what it detected on each page and every correction
+made by hand, so the detection can be improved from real use. Entries go
+to `logs/edits-YYYY-MM-DD.jsonl` in the project folder of the computer
+running the app (`npm run dev` or `npm run preview`), one JSON entry per
+line; nothing leaves that computer. The app says so under the export
+button.
+
+- `page_analyzed`: per page, the boxes the program found (question
+  number, box, passage box), the page size, profile, and whether the text
+  layer or OCR was used.
+- Corrections, each with the book, PDF page and profile:
+  - `box_moved`, `box_resized`: the box before and after, which edges moved
+    and by how much (`edges`), and against the detected box
+    (`fromDetected`).
+  - `box_added`, `box_deleted`: a missed question drawn by hand, a wrong
+    detection removed.
+  - `number_changed`: old and new question number.
+  - `passage_added`, `passage_moved`, `passage_resized`, `passage_deleted`,
+    `passage_attached`, `passage_detached`.
+- `page_viewed` (time spent, whether anything was changed): a page looked
+  at and left unchanged counts as one the program got right.
+- `export` and `page_final`: every page's final crops at export.
+
+Boxes are in 0–1000 page units (thousandths of the page width/height), so
+`"bottom": -25` means the bottom edge was moved up by 2.5% of the page.
+
+To read the logs (one user's `logs` folder, several folders, or files):
+
+```bash
+npm run logs
+node scripts/summarize-logs.mjs ./logs-from-user1 ./logs-from-user2 --pages
+```
+
+It prints how many pages each book needed corrected, corrections by kind,
+which way corrected box edges moved (e.g. bottom edges pulled up: crops
+running into the footer), and with `--pages` every corrected page.
+
 ## File names
 
 `[test<NN>_][<topic>_]q<N>_<page>.jpg`, lowercase, Turkish letters kept.

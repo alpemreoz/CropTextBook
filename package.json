@@ -7,7 +7,8 @@
     "dev": "vite",
     "build": "vite build",
     "preview": "vite preview",
-    "cli": "node cli/qcrop.mjs"
+    "cli": "node cli/qcrop.mjs",
+    "logs": "node scripts/summarize-logs.mjs"
   },
   "dependencies": {
     "@google/genai": "^1.40.0",
