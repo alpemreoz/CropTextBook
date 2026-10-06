@@ -13,6 +13,11 @@ dist-ssr
 *.local
 .env
 
+# Q-Crop CLI default output + Tesseract language cache
+q-crop-out
+*.traineddata
+*.traineddata.gz
+
 # Editor directories and files
 .vscode/*
 !.vscode/extensions.json
@@ -23,3 +28,6 @@ dist-ssr
 *.njsproj
 *.sln
 *.sw?
+
+# Local test harness (debug overlays, sample scoring)
+.qcrop-test/
