@@ -67,8 +67,9 @@ is processing: browsers pause PDF page rendering in background tabs.
   it or its handles to adjust it, or **Delete** it. A crop's
   **+ passage ✕** chip drops the passage from that one crop. Esc cancels
   drawing and closes the panel.
-- **Navigation**: picking a page on the left scrolls the crop list to that
-  page; clicking a box on the page scrolls to its crop.
+- **Navigation**: the ‹ › buttons beside the page (or the ← → keys) go to
+  the previous/next page; picking a page on the left scrolls the crop list
+  to that page; clicking a box on the page scrolls to its crop.
 
 ## File names
 
@@ -113,7 +114,9 @@ from the PDF at 600 dpi, so text and vector drawings stay sharp. `--dpi 800`
 (or any 72–1200) changes the crop resolution without changing what's
 detected, `--week` prefixes crop names with the page's week (see File
 names), and `--png` writes lossless PNGs instead of JPEGs (quality 95,
-no chroma subsampling). A 161-page text-layer PDF takes about 45 s.
+no chroma subsampling). `--pages 10-40,52` analyzes only those PDF pages
+(the table of contents and answer key are still read from the whole book),
+and `--dry-run` reports what would be cropped without writing images. A 161-page text-layer PDF takes about 45 s.
 
 The web app works the same way: previews come from a smaller page render,
 and **Export** re-renders PDF crops at 600 dpi.
@@ -155,6 +158,8 @@ it analyzes the loaded pages again.
 | `ucdortbes` | ÜçDörtBeş – TYT Matematik Soru Bankası |
 | `3d` | 3D Yayınları – TYT Matematik Soru Bankası |
 | `apotemi` | Apotemi – TYT Matematik Soru Bankası |
+| `4d` | 4D Serisi (NEV) – 8. Sınıf Soru Bankası (all subjects) |
+| `atom` | Atom – 8. Sınıf Konu Testleri (all subjects) |
 
 What a profile can switch on (see `core/profiles.mjs`, where each profile
 lists only what differs from the defaults):
@@ -178,12 +183,47 @@ lists only what differs from the defaults):
 - `answerKey`: the answers printed on the page (`bottom` strip, or `top`
   for books printing them under the test title) are read for
   **answers.csv** and the **self-check**.
+- `mixedColumns` (text-layer PDFs): pages that mix full-width questions
+  and passages with two-column stretches are cut into bands. A question
+  numbered at the left margin is full width when no right-column number
+  sits beside it and its text runs across the gutter (or its A)–D) options
+  spread across it); a run of lines crossing the gutter without a number is
+  a full-width passage. Questions that take a whole page work the same way.
+- `bookIndex`: the book's table of contents ("İçindekiler") and answer key
+  ("CEVAP ANAHTARI") are read. Each test's pages come from the contents
+  (checked against the pages where question 1 starts, since contents pages
+  can be a page or two off), crops are named after their test, and every
+  test is checked against its row in the answer key.
+- `answerMarks`: answers hidden in the text layer (an invisible "DDD" at
+  each question's margin, as these publishers print) give each crop its
+  answer where no answer key does.
+- `titleFromHeader`: the test number and topic printed together in the
+  header ("1  Metni Görsellerle Yorumlama") name the test's crops.
+
+### Grade-8 books (`4d`, `atom`)
+
+Options run A)–D). Crops of a `4d` book are named after their test in the
+table of contents: `<unit>_ünite_<topic>_<test>_q<N>_s<page>.jpg`, e.g.
+`1_ünite_çarpanlar_ve_katlar_doğrula_1_q3_s10.jpg`; tests for several units
+("DENE TESTİ - 1 (1. Ünite)") are named on their own:
+`dene_testi_1_q5_s52.jpg`. Atom books have no contents pages; their header
+gives the test number and topic: `test01_metni_görsellerle_yorumlama_q1_s1.jpg`.
+The English book's units are named the same way (`1_unit_friendship_remember_1_…`).
+
+Every answer comes from the book's printed answer key (`4d`) or, for Atom
+books, from the answer hidden at each question; where the two disagree
+(a handful of English questions), the key is used and `check.txt` lists
+them. Things the text layer can't help with: a question printed entirely
+as a picture (no text at all) isn't found, and two-column passages beside
+an image-only figure may need a hand-drawn passage box.
 
 ### answers.csv and the self-check
 
 With an answer-key profile the CLI writes `answers.csv` (file, page,
 question, answer) and `check.txt` next to the crops, and prints a one-line
-summary. The self-check groups the book into tests (numbering starts over
+summary. With `bookIndex`, `check.txt` lists per test the questions in the
+answer key that weren't cropped, crops whose number isn't in the key, and
+numbers cropped twice. The self-check groups the book into tests (numbering starts over
 in each) and compares each test's crops with its printed answers:
 questions printed but not cropped, and crops beyond the printed answers.
 In the web app each crop shows its answer, pages of a test with missing

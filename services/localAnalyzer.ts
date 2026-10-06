@@ -28,6 +28,10 @@ export interface LocalAnalysis extends AnalysisResult {
   plainTopic?: string;
   /** Answers printed on the page (profiles with `answerKey`). */
   answers?: { n: number; letter: string }[];
+  /** Answers hidden in the text layer, by question number (`answerMarks`). */
+  marked?: Record<string, string>;
+  /** What the book's contents need from this page (`bookIndex`). */
+  contents?: any;
   /** Digit shapes of the badge number, for reading it by shape (scans). */
   weekGlyphs?: { aspect: number; bits: string }[];
   fromTextLayer: boolean;
@@ -123,8 +127,12 @@ export const analyzeTestPageLocal = async (
   const map = core.buildInkMap(rgba, W, H, 4);
 
   const fromText = core.textLayerUsable(textItems);
-  const words: Word[] = fromText ? core.wordsFromTextItems(textItems, W, H) : [];
-  const layout = core.detectLayout(map, core.labelBoxesFromWords(words), opts);
+  let words: Word[] = fromText ? core.wordsFromTextItems(textItems, W, H) : [];
+  // Hidden answer marks, read before invisible text is dropped.
+  const marks = fromText ? core.hiddenAnswerMarks(words) : [];
+  if (fromText && opts.mixedColumns) words = core.tidyTextWords(words, W, map);
+  let layout = core.detectLayout(map, core.labelBoxesFromWords(words), opts);
+  if (fromText && opts.mixedColumns) layout = core.mixedColumns(map, layout, words, marks);
 
   // OCR one region of the page in isolation (columns would otherwise merge
   // into single lines spanning the whole page) and offset boxes back into
@@ -162,8 +170,8 @@ export const analyzeTestPageLocal = async (
   if (fromText) {
     headerLines = core.linesInRegion(words, 0, 0, W, layout.contentTop);
     footerLines = core.linesInRegion(words, 0, layout.footerTop, W, H);
-    columnLines = layout.columns.map(c =>
-      core.linesInRegion(words, c.x0 - 5, layout.contentTop, c.x1 + 5, layout.contentBottom));
+    columnLines = layout.columns.map((c: any) =>
+      core.linesInRegion(words, c.x0 - 5, c.y0 ?? layout.contentTop, c.x1 + 5, c.y1 ?? layout.contentBottom));
     allLines = core.groupLines(words);
   } else {
     // Question numbers read on their own from each column's margin (from
@@ -352,16 +360,37 @@ export const analyzeTestPageLocal = async (
     answers = core.parseAnswerKey(texts);
   }
 
+  // Answers hidden in the text layer (profiles with `answerMarks`), per
+  // question number.
+  let marked: Record<string, string> | undefined;
+  if (fromText && opts.answerMarks) {
+    marked = {};
+    for (const r of regions) {
+      const letter = core.markedAnswer(r, marks, W, H);
+      if (letter) marked[r.questionNumber] = letter;
+    }
+  }
+  // Contents and answer-key pages, and what the book-level contents need
+  // from every page (profiles with `bookIndex`).
+  const contents = fromText && opts.bookIndex ? core.contentsPageInfo(allLines, W, H) : undefined;
+  // Test number and topic printed together in the header ("1  Metni
+  // Görsellerle Yorumlama"), for profiles with `titleFromHeader`.
+  const title = fromText && opts.titleFromHeader
+    ? core.readNumberedTitle(allLines.filter(l => l.bbox.y1 < H * 0.12))
+    : {};
+
   return {
     answers,
+    marked,
+    contents,
     pageNumber: core.readPageNumber(footerLines, W) ?? 'unknown',
-    testNumber,
+    testNumber: title.testNumber ?? testNumber,
     topic: section ?? headerTopic,
     section,
     headerTopic,
     // Profiles naming per test: the first header line that reads as a topic.
     plainTopic: opts.namesPerTest
-      ? [headerTopic, ...headerLines.map(l => l.text)].map(t => core.plausibleTopic(t, opts.topicIgnore)).find(Boolean)
+      ? [title.topic, headerTopic, ...headerLines.map(l => l.text)].map(t => core.plausibleTopic(t, opts.topicIgnore)).find(Boolean)
       : undefined,
     coverTopic,
     week,

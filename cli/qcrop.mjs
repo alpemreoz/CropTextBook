@@ -43,6 +43,10 @@ let week = false;
 // Book profile (core/profiles.mjs): settings for book series the defaults
 // don't handle. None = the defaults every earlier book was verified with.
 let profileName = '';
+// PDF pages to analyze ("10-40,52"); all by default.
+let pageSpec = null;
+// Analyze and report only; write no crops.
+let dryRun = false;
 const inputs = [];
 for (let i = 0; i < args.length; i++) {
   if (args[i] === '-o' || args[i] === '--out') outDir = args[++i];
@@ -50,15 +54,26 @@ for (let i = 0; i < args.length; i++) {
   else if (args[i] === '--png') png = true;
   else if (args[i] === '--week') week = true;
   else if (args[i] === '--profile') profileName = args[++i];
+  else if (args[i] === '--pages') pageSpec = args[++i];
+  else if (args[i] === '--dry-run') dryRun = true;
   else inputs.push(args[i]);
 }
 let opts;
 try { opts = profileOptions(profileName); } catch (err) { console.error(err.message); process.exit(1); }
 if (inputs.length === 0 || !(dpi >= 72 && dpi <= 1200)) {
-  console.error('Usage: node cli/qcrop.mjs <PDFs, images or folders...> [-o <output dir>] [--dpi <72-1200, default 600>] [--png] [--week] [--profile <name>]');
+  console.error('Usage: node cli/qcrop.mjs <PDFs, images or folders...> [-o <output dir>] [--dpi <72-1200, default 600>] [--png] [--week] [--profile <name>] [--pages 10-40,52] [--dry-run]');
   console.error(`Profiles: ${Object.keys(PROFILES).join(', ')}`);
   process.exit(1);
 }
+
+/** "10-40,52" -> predicate on PDF page numbers (1-based). */
+const pageFilter = (spec) => {
+  if (!spec) return () => true;
+  const ranges = spec.split(',').map(r => r.split('-').map(v => parseInt(v, 10)))
+    .map(([a, b]) => [a, Number.isFinite(b) ? b : a]);
+  return (p) => ranges.some(([a, b]) => p >= a && p <= b);
+};
+const wantPage = pageFilter(pageSpec);
 
 const IMAGE_RE = /\.(jpe?g|png|webp)$/i;
 const PDF_RE = /\.pdf$/i;
@@ -98,29 +113,34 @@ const pdfTextLayer = async (pdfPath) => {
     const items = [];
     for (const wm of pm[3].matchAll(wordRe)) {
       const [x0, y0, x1, y1] = [wm[1], wm[2], wm[3], wm[4]].map(parseFloat);
-      const str = decodeEntities(wm[5]);
+      // Fonts without a proper Unicode map yield control characters (as in
+      // the web app's normalizePdfTextItems).
+      const str = decodeEntities(wm[5]).replace(/[\t\n\r]/g, ' ').replace(/[\u0000-\u001f]/g, '');
+      if (!str.trim()) continue;
       // Vertical watermarks come out as tall, narrow boxes.
       if (str.length >= 3 && (y1 - y0) > 1.5 * (x1 - x0)) continue;
       items.push({ str, x0: x0 / pw, y0: y0 / ph, x1: x1 / pw, y1: y1 / ph });
     }
+    // (page shape, for laying out the text of pages that aren't rendered)
+    items.aspect = ph / pw;
     pages.push(items);
   }
   return pages;
 };
 
-/** Render every page to JPEG in parallel page ranges; returns pageNo -> file. */
-const renderPdf = async (pdfPath, numPages, dir) => {
-  const jobs = Math.max(1, Math.min(os.cpus().length, 8, numPages));
-  const per = Math.ceil(numPages / jobs);
+/** Render the given pages to JPEG in parallel page ranges; returns pageNo -> file. */
+const renderPdf = async (pdfPath, pageNos, dir) => {
+  // Contiguous runs, split so every core gets a share.
+  const per = Math.max(1, Math.ceil(pageNos.length / Math.max(1, Math.min(os.cpus().length, 8))));
   const runs = [];
-  for (let f = 1; f <= numPages; f += per) {
-    const l = Math.min(numPages, f + per - 1);
-    runs.push(execFileP('pdftoppm', [
-      '-f', String(f), '-l', String(l), '-r', String(ANALYSIS_DPI),
-      '-jpeg', '-jpegopt', 'quality=95', pdfPath, path.join(dir, 'p'),
-    ]));
+  for (const p of pageNos) {
+    const last = runs[runs.length - 1];
+    if (last && p === last[1] + 1 && last[1] - last[0] + 1 < per) last[1] = p; else runs.push([p, p]);
   }
-  await Promise.all(runs);
+  await Promise.all(runs.map(([f, l]) => execFileP('pdftoppm', [
+    '-f', String(f), '-l', String(l), '-r', String(ANALYSIS_DPI),
+    '-jpeg', '-jpegopt', 'quality=95', pdfPath, path.join(dir, 'p'),
+  ])));
   const files = new Map();
   for (const f of await readdir(dir)) {
     const m = /^p-(\d+)\.jpg$/.exec(f);
@@ -131,6 +151,7 @@ const renderPdf = async (pdfPath, numPages, dir) => {
 
 const tmpRoot = await mkdtemp(path.join(os.tmpdir(), 'qcrop-'));
 const pages = []; // { file, name, source?, pdfPage?, textItems? } in document order
+const bookText = new Map(); // PDF -> text items of every page (contents and answer key)
 
 for (const file of inputFiles) {
   if (PDF_RE.test(file)) {
@@ -145,8 +166,9 @@ for (const file of inputFiles) {
       }
       throw err;
     }
+    bookText.set(file, text);
     const dir = await mkdtemp(path.join(tmpRoot, 'pdf-'));
-    const rendered = await renderPdf(file, text.length, dir);
+    const rendered = await renderPdf(file, text.map((_, i) => i + 1).filter(wantPage), dir);
     for (let i = 1; i <= text.length; i++) {
       if (!rendered.has(i)) continue;
       pages.push({
@@ -158,7 +180,7 @@ for (const file of inputFiles) {
         textItems: text[i - 1],
       });
     }
-    console.log(`${path.basename(file)}: ${text.length} page(s) rendered in ${((Date.now() - t0) / 1000).toFixed(1)}s`);
+    console.log(`${path.basename(file)}: ${rendered.size === text.length ? '' : `${rendered.size} of `}${text.length} page(s) rendered in ${((Date.now() - t0) / 1000).toFixed(1)}s`);
   } else if (IMAGE_RE.test(file)) {
     // Numbered page images ("Book_Sayfa_012.jpg") are read as one book in
     // page order, like a PDF.
@@ -251,8 +273,12 @@ const analyzePage = async (page) => {
   const gray = await sharp(file).resize(W, H, { fit: 'fill' }).grayscale().raw().toBuffer();
   const map = core.buildInkMap(gray, W, H, 1);
   const fromText = core.textLayerUsable(page.textItems);
-  const words = fromText ? core.wordsFromTextItems(page.textItems, W, H) : [];
-  const layout = core.detectLayout(map, core.labelBoxesFromWords(words), opts);
+  let words = fromText ? core.wordsFromTextItems(page.textItems, W, H) : [];
+  // Hidden answer marks, read before invisible text is dropped.
+  const marks = fromText ? core.hiddenAnswerMarks(words) : [];
+  if (fromText && opts.mixedColumns) words = core.tidyTextWords(words, W, map);
+  let layout = core.detectLayout(map, core.labelBoxesFromWords(words), opts);
+  if (fromText && opts.mixedColumns) layout = core.mixedColumns(map, layout, words, marks);
 
   // A region (analysis coords) cut from the full-resolution original.
   const regionPng = async (x0, y0, x1, y1, upscale = 1, blur = 0) => {
@@ -282,7 +308,7 @@ const analyzePage = async (page) => {
     headerLines = core.linesInRegion(words, 0, 0, W, layout.contentTop);
     footerLines = core.linesInRegion(words, 0, layout.footerTop, W, H);
     columnLines = layout.columns.map(c =>
-      core.linesInRegion(words, c.x0 - 5, layout.contentTop, c.x1 + 5, layout.contentBottom));
+      core.linesInRegion(words, c.x0 - 5, c.y0 ?? layout.contentTop, c.x1 + 5, c.y1 ?? layout.contentBottom));
     allLines = core.groupLines(words);
   } else {
     // Question numbers read on their own from each column's margin (from
@@ -445,6 +471,20 @@ const analyzePage = async (page) => {
     }
   }
 
+  // Answers hidden in the text layer (profiles with `answerMarks`).
+  let marked;
+  if (fromText && opts.answerMarks) {
+    marked = {};
+    for (const r of regions) {
+      const letter = core.markedAnswer(r, marks, W, H);
+      if (letter) marked[r.questionNumber] = letter;
+    }
+  }
+  // Test number and topic printed together in the header ("1  Metni
+  // Görsellerle Yorumlama"; profiles with `titleFromHeader`).
+  const title = fromText && opts.titleFromHeader ? core.readNumberedTitle(allLines.filter(l => l.bbox.y1 < H * 0.12)) : {};
+  if (title.testNumber) testNumber = title.testNumber;
+
   // Printed answers (profiles with `answerKey`), for answers.csv and the
   // self-check: a few OCR passes over the answer band, merged.
   let answers;
@@ -458,13 +498,17 @@ const analyzePage = async (page) => {
   }
 
   return {
-    regions, testNumber, pageNumber, pageLabel, ow, oh, fromText, answers,
+    regions, testNumber, pageNumber, pageLabel, ow, oh, fromText, answers, marked,
+    // (for the test harness's overlays)
+    cells: process.env.QCROP_DUMP ? layout.columns.map(c => ({
+      x0: c.x0 / W, x1: c.x1 / W, y0: (c.y0 ?? layout.contentTop) / H, y1: (c.y1 ?? layout.contentBottom) / H,
+    })) : undefined,
     section: core.readSection(headerLines),
     week: pageWeek, weekUnsure, weekGlyphs,
     headerTopic: core.readHeaderTopic(headerLines, W),
     // Profiles naming per test: the first header line that reads as a topic.
     plainTopic: opts.namesPerTest
-      ? [core.readHeaderTopic(headerLines, W), ...headerLines.map(l => l.text)].map(t => core.plausibleTopic(t, opts.topicIgnore)).find(Boolean)
+      ? [title.topic, core.readHeaderTopic(headerLines, W), ...headerLines.map(l => l.text)].map(t => core.plausibleTopic(t, opts.topicIgnore)).find(Boolean)
       : undefined,
     coverTopic,
   };
@@ -574,9 +618,65 @@ for (const idxs of bySource.values()) {
   }
 }
 
-// Printed answers vs crops, per book (profiles with `answerKey`).
+// Answers per crop and the self-check lines (answers.csv, check.txt).
 const answerOf = new Map(); // `${pageIndex}:${n}` -> letter
 const checkLines = [];
+const withAnswers = !!(opts.answerKey || opts.bookIndex || opts.answerMarks);
+
+// Books with a table of contents and an answer key (profiles with
+// `bookIndex`): crops are named after their test in the contents and
+// checked against the key.
+if (opts.bookIndex) {
+  let tests = 0, clean = 0, missingTotal = 0, extraTotal = 0;
+  for (const [book, idxs] of bySource) {
+    const text = bookText.get(book);
+    if (!text) continue;
+    const contents = core.bookContents(text.map((items, k) => {
+      const W = 2000, H = Math.round(2000 * items.aspect);
+      return { pdfPage: k + 1, ...core.contentsPageInfo(core.groupLines(core.wordsFromTextItems(items, W, H)), W, H) };
+    }), text.length);
+    if (!contents.tests.length) { console.log(`${path.basename(book)}: no table of contents found`); continue; }
+    for (const i of idxs) {
+      const t = contents.tests[contents.testAt(pages[i].pdfPage)];
+      if (!t) continue;
+      topics[i] = core.contentsTestName(t);
+      results[i].testNumber = undefined;
+    }
+    const check = core.checkAgainstKey(contents, idxs.map(i => ({ pdfPage: pages[i].pdfPage, questions: results[i].regions.map(q => +q.questionNumber) })));
+    for (const i of idxs) for (const q of results[i].regions) {
+      const letter = check.answerOf(pages[i].pdfPage, +q.questionNumber);
+      if (letter) answerOf.set(`${i}:${q.questionNumber}`, letter);
+    }
+    // Only tests whose pages were all analyzed (--pages may cover part of the book).
+    const analyzed = new Set(idxs.map(i => pages[i].pdfPage));
+    for (const r of check.report) {
+      let all = true;
+      for (let pg = r.test.start; pg <= r.test.end; pg++) if (!analyzed.has(pg)) all = false;
+      if (!all) continue;
+      tests++;
+      if (!r.missing.length && !r.extra.length && !r.duplicate.length) { clean++; continue; }
+      missingTotal += r.missing.length; extraTotal += r.extra.length;
+      checkLines.push(`${path.basename(book)} s${r.test.start}-s${r.test.end} ${core.contentsTestName(r.test)}:` +
+        `${r.missing.length ? ` not cropped: ${r.missing.join(',')}` : ''}` +
+        `${r.extra.length ? ` | not in the answer key: ${r.extra.join(',')}` : ''}` +
+        `${r.duplicate.length ? ` | cropped twice: ${r.duplicate.join(',')}` : ''}`);
+    }
+  }
+  console.log(`Self-check: ${clean}/${tests} tests match the answer key; ${missingTotal} question(s) not cropped, ${extraTotal} not in the key (see check.txt)`);
+}
+// Answers hidden in the text layer fill in where no key gives one. Where
+// both exist and disagree, the printed key wins; check.txt lists them.
+if (opts.answerMarks) {
+  const disagree = [];
+  pages.forEach((p, i) => results[i]?.regions.forEach(q => {
+    const letter = results[i].marked?.[q.questionNumber], key = answerOf.get(`${i}:${q.questionNumber}`);
+    if (letter && !key) answerOf.set(`${i}:${q.questionNumber}`, letter);
+    else if (letter && key !== letter) disagree.push(`${results[i].pageLabel} Q${q.questionNumber}: key ${key}, hidden mark ${letter}`);
+  }));
+  if (disagree.length) checkLines.push(`Answer key and the question's hidden answer disagree (the key is used): ${disagree.join('; ')}`);
+}
+
+// Printed answers vs crops, per book (profiles with `answerKey`).
 if (opts.answerKey) {
   const books = new Map();
   pages.forEach((p, i) => { if (results[i]) { const k = p.source ?? p.file; if (!books.has(k)) books.set(k, []); books.get(k).push(i); } });
@@ -620,7 +720,7 @@ for (let i = 0; i < pages.length; i++) {
     for (let k = 2; used.has(name); k++) name = name.replace(/(_\d+)?\.(jpg|png)$/, `_${k}.$2`);
     used.add(name);
     cropJobs.push(() => cropRegion(pages[i], r.ow, r.oh, region, path.join(outDir, name)));
-    if (opts.answerKey) csvRows.push([name, r.pageLabel, region.questionNumber, answerOf.get(`${i}:${region.questionNumber}`) ?? '']);
+    if (withAnswers) csvRows.push([name, r.pageLabel, region.questionNumber, answerOf.get(`${i}:${region.questionNumber}`) ?? '']);
     total++;
   }
   if (r.regions.length > 0 || !pages[i].source) {
@@ -636,17 +736,26 @@ for (let i = 0; i < pages.length; i++) {
     if (shared.length) console.log(`    with shared passage: ${shared.map(q => 'Q' + q.questionNumber).join(' ')}`);
   }
 }
+if (dryRun) cropJobs.length = 0;
+// Test harness: the analysis as JSON.
+if (process.env.QCROP_DUMP) {
+  await writeFile(process.env.QCROP_DUMP, JSON.stringify(pages.map((p, i) => results[i] && {
+    source: p.source && path.basename(p.source), pdfPage: p.pdfPage, file: path.basename(p.file),
+    topic: topics[i], testNumber: results[i].testNumber, cells: results[i].cells,
+    regions: results[i].regions.map(r => ({ n: r.questionNumber, box: r.box, contextBox: r.contextBox, answer: answerOf.get(`${i}:${r.questionNumber}`) })),
+  })));
+}
 let nextJob = 0;
 await Promise.all(Array.from({ length: Math.max(2, os.cpus().length) }, async () => {
   while (nextJob < cropJobs.length) await cropJobs[nextJob++]();
 }));
 
-if (opts.answerKey) {
+if (withAnswers) {
   const q = (v) => /[",\n]/.test(String(v)) ? `"${String(v).replace(/"/g, '""')}"` : String(v);
   await writeFile(path.join(outDir, 'answers.csv'), ['file,page,question,answer', ...csvRows.map(r => r.map(q).join(','))].join('\n') + '\n');
-  await writeFile(path.join(outDir, 'check.txt'), (checkLines.join('\n') || 'All tests match their printed answers.') + '\n');
+  await writeFile(path.join(outDir, 'check.txt'), (checkLines.join('\n') || (opts.answerKey || opts.bookIndex ? 'All tests match their answers.' : 'No answer key to check against.')) + '\n');
 }
-console.log(`Done: ${total} crop(s) in ${((Date.now() - t0) / 1000).toFixed(1)}s -> ${outDir}/`);
+console.log(`Done: ${total} ${dryRun ? 'question(s) found (dry run, nothing written)' : 'crop(s)'} in ${((Date.now() - t0) / 1000).toFixed(1)}s -> ${outDir}/`);
 if (schedulerPromise) await (await schedulerPromise).terminate();
 if (digitWorkerPromise) await (await digitWorkerPromise).terminate();
 await rm(tmpRoot, { recursive: true, force: true });

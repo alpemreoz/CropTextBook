@@ -2,10 +2,10 @@ import React, { useState, useEffect, useRef, useCallback, useMemo } from 'react'
 import Uploader from './components/Uploader';
 import { analyzeTestPageLocal } from './services/localAnalyzer';
 import { expandFiles, LoadedPage, PDF_EXPORT_DPI } from './services/fileLoader';
-import { cropFileName, resolveTopics, resolveWeeks, imageSequence, cropRect, maskRect, stackLayout, checkAnswers, testSegments, majority } from './core/qcropCore.mjs';
+import { cropFileName, resolveTopics, resolveWeeks, imageSequence, cropRect, maskRect, stackLayout, checkAnswers, testSegments, majority, bookContents, contentsTestName, checkAgainstKey } from './core/qcropCore.mjs';
 import { PROFILES, profileOptions } from './core/profiles.mjs';
 import { QuestionRegion, AppStatus, BoundingBox, PageData } from './types';
-import { LoaderIcon, DownloadIcon, ScissorsIcon, TrashIcon, PlusIcon } from './components/Icons';
+import { LoaderIcon, DownloadIcon, ScissorsIcon, TrashIcon, PlusIcon, ChevronLeftIcon, ChevronRightIcon } from './components/Icons';
 
 type ResizeHandle = 'nw' | 'n' | 'ne' | 'e' | 'se' | 's' | 'sw' | 'w';
 
@@ -80,12 +80,16 @@ export default function App() {
   useEffect(() => { setTool('select'); setSelectedPassage(null); setDraftBox(null); }, [activePageId]);
 
   // Esc cancels drawing and closes the passage panel; Delete/Backspace
-  // removes the selected crop (or the selected passage). Not while typing.
+  // removes the selected crop (or the selected passage); the left and right
+  // arrow keys go to the previous/next page. Not while typing.
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
-      if ((e.target as HTMLElement)?.tagName === 'INPUT') return;
+      if (['INPUT', 'SELECT', 'TEXTAREA'].includes((e.target as HTMLElement)?.tagName)) return;
       if (e.key === 'Escape') {
         setTool('select'); setSelectedPassage(null); setDraftBox(null); dragRef.current = null;
+      } else if ((e.key === 'ArrowLeft' || e.key === 'ArrowRight') && !e.metaKey && !e.ctrlKey && !e.altKey && dragRef.current === null) {
+        e.preventDefault();
+        goPage(e.key === 'ArrowLeft' ? -1 : 1);
       } else if ((e.key === 'Delete' || e.key === 'Backspace') && activePage) {
         if (selectedPassage) { e.preventDefault(); deleteSelectedPassage(); return; }
         const sel = activePage.regions.find(r => r.isSelected);
@@ -124,6 +128,15 @@ export default function App() {
     pages.find(p => p.id === activePageId), [pages, activePageId]
   );
 
+  // Previous/next page (buttons beside the page, arrow keys); the crop list
+  // follows, as when a thumbnail is picked.
+  const goPage = (delta: number) => {
+    const idx = pages.findIndex(p => p.id === activePageId) + delta;
+    if (idx < 0 || idx >= pages.length) return;
+    setActivePageId(pages[idx].id);
+    revealInList(`page-section-${pages[idx].id}`, 'start');
+  };
+
   // Effective topic per page. Pages are analyzed concurrently, so
   // inheritance from unit covers is derived from state rather than at
   // analysis time: within one PDF, in document order, a page without its own
@@ -149,11 +162,55 @@ export default function App() {
     return out;
   }, [pages]);
 
-  // Printed answers vs crops (profiles with answer keys), per book: each
-  // crop's answer, and per page the questions its test is missing.
-  const answerCheck = useMemo(() => {
+  // Books with a table of contents and an answer key (profiles with
+  // `bookIndex`): each page's test from the contents, its answers from the
+  // key. Per PDF; pages still being analyzed simply aren't counted yet.
+  const bookIndex = useMemo(() => {
+    const nameOf = new Map<string, string>(); // page id -> test name for crop files
     const answerOf = new Map<string, string>(); // region id -> letter
-    const missingOn = new Map<string, number[]>(); // page id -> missing numbers of its test
+    const missingOn = new Map<string, number[]>(); // page id -> key numbers its test lacks
+    if (!profileOptions(profile).bookIndex) return { nameOf, answerOf, missingOn };
+    const byBook = new Map<string, PageData[]>();
+    for (const p of pages) {
+      if (!p.pdf || p.status !== 'READY' || !p.contents) continue;
+      if (!byBook.has(p.pdf.source)) byBook.set(p.pdf.source, []);
+      byBook.get(p.pdf.source)!.push(p);
+    }
+    for (const group of byBook.values()) {
+      const total = pages.filter(p => p.pdf?.source === group[0].pdf!.source).length;
+      const contents = bookContents(group.map(p => ({ pdfPage: p.pdf!.pageIndex, ...p.contents })), total);
+      const check = checkAgainstKey(contents, group.map(p => ({
+        pdfPage: p.pdf!.pageIndex, questions: p.regions.map(r => parseInt(r.questionNumber, 10)).filter(n => !isNaN(n)),
+      })));
+      const ready = new Set(group.map(p => p.pdf!.pageIndex));
+      for (const p of group) {
+        const t: any = contents.tests[contents.testAt(p.pdf!.pageIndex)];
+        if (!t) continue;
+        nameOf.set(p.id, contentsTestName(t));
+        for (const r of p.regions) {
+          const letter = check.answerOf(p.pdf!.pageIndex, parseInt(r.questionNumber, 10));
+          if (letter) answerOf.set(r.id, letter);
+        }
+        // Only once every page of the test is in.
+        const rep = check.report.find((x: any) => x.test === t);
+        let all = true;
+        for (let pg = t.start; pg <= t.end; pg++) if (!ready.has(pg)) all = false;
+        if (rep && all && rep.missing.length) missingOn.set(p.id, rep.missing);
+      }
+    }
+    return { nameOf, answerOf, missingOn };
+  }, [pages, profile]);
+
+  // Printed answers vs crops (profiles with answer keys), per book: each
+  // crop's answer, and per page the questions its test is missing. Answers
+  // hidden in the text layer (`answerMarks`) fill in where no key gives one.
+  const answerCheck = useMemo(() => {
+    const answerOf = new Map<string, string>(bookIndex.answerOf); // region id -> letter
+    const missingOn = new Map<string, number[]>(bookIndex.missingOn); // page id -> missing numbers of its test
+    for (const p of pages) for (const r of p.regions) {
+      const letter = p.marked?.[r.questionNumber];
+      if (letter && !answerOf.has(r.id)) answerOf.set(r.id, letter);
+    }
     const byBook = new Map<string, { page: PageData; order: number }[]>();
     for (const p of pages) {
       if (!p.answers || p.status !== 'READY') continue;
@@ -176,13 +233,18 @@ export default function App() {
       }
     }
     return { answerOf, missingOn };
-  }, [pages]);
+  }, [pages, bookIndex]);
 
   // Profiles naming per test: a test's number and topic come from whichever
   // of its pages read them (the most common reading wins).
   const perTestNames = useMemo(() => {
     const testOf = new Map<string, string | undefined>();
     const topicOf = new Map<string, string | undefined>();
+    // Names from the table of contents ("1 ünite Çarpanlar ve Katlar Doğrula - 1").
+    if (profileOptions(profile).bookIndex) {
+      for (const p of pages) if (bookIndex.nameOf.has(p.id)) { testOf.set(p.id, undefined); topicOf.set(p.id, bookIndex.nameOf.get(p.id)); }
+      return { testOf, topicOf };
+    }
     if (!profileOptions(profile).namesPerTest) return { testOf, topicOf };
     const byBook = new Map<string, { page: PageData; order: number }[]>();
     for (const p of pages) {
@@ -203,7 +265,7 @@ export default function App() {
       }
     }
     return { testOf, topicOf };
-  }, [pages, profile]);
+  }, [pages, profile, bookIndex]);
 
   /** The topic shown and used for a page: per test under profiles that name per test. */
   const pageTopic = (pageId: string) =>
@@ -345,6 +407,8 @@ export default function App() {
         weekGlyphs: result.weekGlyphs,
         answers: result.answers,
         plainTopic: result.plainTopic,
+        marked: result.marked,
+        contents: result.contents,
         regions: regionsWithData
       } : p));
     } catch (err: any) {
@@ -788,7 +852,7 @@ export default function App() {
         if (blob) zip.file(name, blob);
       }
       // The printed answers of every exported crop (profiles with answer keys).
-      if (pages.some(p => p.answers)) {
+      if (answerCheck.answerOf.size > 0) {
         const q = (v: string) => /[",\n]/.test(v) ? `"${v.replace(/"/g, '""')}"` : v;
         const rows = jobs.map(({ page, region }, i) => [names[i], page.pageLabel ?? page.pageNumber, region.questionNumber, answerCheck.answerOf.get(region.id) ?? '']);
         zip.file('answers.csv', ['file,page,question,answer', ...rows.map(r => r.map(v => q(String(v))).join(','))].join('\n') + '\n');
@@ -876,7 +940,26 @@ export default function App() {
               ))}
             </div>
 
-            <div className="flex-1 bg-slate-100 p-6 overflow-hidden relative flex flex-col" ref={containerRef}>
+            <div className="flex-1 bg-slate-100 py-6 px-14 overflow-hidden relative flex flex-col" ref={containerRef}>
+                {/* Previous / next page, beside the page */}
+                {[-1, 1].map(d => {
+                  const idx = pages.findIndex(p => p.id === activePageId) + d;
+                  const disabled = idx < 0 || idx >= pages.length;
+                  return (
+                    <button
+                      key={d}
+                      onClick={() => goPage(d)}
+                      disabled={disabled}
+                      title={d < 0 ? 'Previous page (←)' : 'Next page (→)'}
+                      aria-label={d < 0 ? 'Previous page' : 'Next page'}
+                      className={`absolute top-1/2 -translate-y-1/2 z-30 w-10 h-20 rounded-2xl flex items-center justify-center shadow-lg transition-all
+                        ${d < 0 ? 'left-2' : 'right-2'}
+                        ${disabled ? 'bg-white/40 text-slate-300 cursor-not-allowed' : 'bg-white/90 text-slate-600 hover:bg-brand-600 hover:text-white'}`}
+                    >
+                      {d < 0 ? <ChevronLeftIcon className="w-6 h-6" /> : <ChevronRightIcon className="w-6 h-6" />}
+                    </button>
+                  );
+                })}
                 <div className="flex-1 flex items-center justify-center relative shadow-2xl bg-slate-300/30 rounded-3xl overflow-hidden border border-slate-200/50">
                     {activePage?.status === 'READY' && (
                       <div className="absolute top-4 left-4 z-20 flex gap-2">

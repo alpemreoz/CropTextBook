@@ -39,6 +39,8 @@ export interface PageData {
   weekGlyphs?: { aspect: number; bits: string }[]; // badge digit shapes (scans)
   answers?: { n: number; letter: string }[]; // answers printed on the page (profiles with answerKey)
   plainTopic?: string; // header line that reads as a topic (profiles naming per test)
+  marked?: Record<string, string>; // answers hidden in the text layer, by question number (answerMarks)
+  contents?: any; // what the book's contents need from this page (bookIndex)
   pdf?: PdfPageRef;
   error?: string;
 }

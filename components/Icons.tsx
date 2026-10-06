@@ -41,3 +41,15 @@ export const ScissorsIcon = ({ className = "w-6 h-6" }: { className?: string }) 
     <path strokeLinecap="round" strokeLinejoin="round" d="M7.645 6.551A3.75 3.75 0 1 1 11.25 10v4.5A3.75 3.75 0 1 1 7.645 18M11.25 10H18m-6.75 4.5H18" />
   </svg>
 );
+
+export const ChevronLeftIcon = ({ className = "w-6 h-6" }: { className?: string }) => (
+  <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" strokeWidth={2.5} stroke="currentColor" className={className}>
+    <path strokeLinecap="round" strokeLinejoin="round" d="M15.75 19.5L8.25 12l7.5-7.5" />
+  </svg>
+);
+
+export const ChevronRightIcon = ({ className = "w-6 h-6" }: { className?: string }) => (
+  <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" strokeWidth={2.5} stroke="currentColor" className={className}>
+    <path strokeLinecap="round" strokeLinejoin="round" d="M8.25 4.5l7.5 7.5-7.5 7.5" />
+  </svg>
+);

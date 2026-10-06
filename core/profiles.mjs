@@ -36,9 +36,20 @@ export const DEFAULTS = {
   namesPerTest: false,
   // Header text never used as a topic (regex sources, case-insensitive).
   topicIgnore: [],
+  // Text layers: pages mixing full-width questions and passages with
+  // two-column stretches are cut into bands (see core mixedColumns).
+  mixedColumns: false,
   // Printed answers to read per page, for answers.csv and the self-check:
   // null, or { band: 'bottom' | 'top' }.
   answerKey: null,
+  // Text-layer books with a table of contents and an answer key: tests are
+  // named from the contents (unit, topic, test) and checked against the key.
+  bookIndex: false,
+  // Answers hidden in the text layer ("DDD" at each question's margin).
+  answerMarks: false,
+  // Test number and topic printed together in the page header ("1  Metni
+  // Görsellerle Yorumlama"), named per test (with namesPerTest).
+  titleFromHeader: false,
 };
 
 export const PROFILES = {
@@ -116,6 +127,20 @@ export const PROFILES = {
     answerSheetGuard: false,
     namesPerTest: true,
     answerKey: { band: 'bottom' },
+  },
+  // Grade-8 question banks (A–D options, text-layer PDFs).
+  '4d': {
+    label: '4D Serisi (NEV) – 8. Sınıf Soru Bankası',
+    mixedColumns: true,
+    bookIndex: true,
+    answerMarks: true,
+  },
+  atom: {
+    label: 'Atom – 8. Sınıf Konu Testleri',
+    mixedColumns: true,
+    answerMarks: true,
+    titleFromHeader: true,
+    namesPerTest: true,
   },
 };
 
