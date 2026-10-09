@@ -47,6 +47,9 @@ export const DEFAULTS = {
   bookIndex: false,
   // Answers hidden in the text layer ("DDD" at each question's margin).
   answerMarks: false,
+  // A shared passage's crop starts with its instruction ("6 – 8: FOR THESE
+  // QUESTIONS, CHOOSE ... ACCORDING TO THE TEXTS BELOW.") and its banner.
+  passageWithInstruction: false,
   // Test number and topic printed together in the page header ("1  Metni
   // Görsellerle Yorumlama"), named per test (with namesPerTest).
   titleFromHeader: false,
@@ -141,6 +144,7 @@ export const PROFILES = {
     answerMarks: true,
     titleFromHeader: true,
     namesPerTest: true,
+    passageWithInstruction: true,
   },
 };
 

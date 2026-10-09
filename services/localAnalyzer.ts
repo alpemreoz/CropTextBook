@@ -241,7 +241,7 @@ export const analyzeTestPageLocal = async (
 
   let regions;
   if (fromText) {
-    const params = { map, layout, columnLines, strictLabels: true, pageLines: allLines };
+    const params = { map, layout, columnLines, strictLabels: true, pageLines: allLines, passageWithInstruction: opts.passageWithInstruction };
     const pending = core.optionlessStrips(params);
     const extraOptionLines: Line[][] = layout.columns.map(() => []);
     if (pending.length) await readShapeLetters(pending, core.capHeightFromStrips(pending, H, true), extraOptionLines);

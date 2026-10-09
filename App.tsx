@@ -512,10 +512,14 @@ export default function App() {
       regions.forEach(r => { if (r.contextBox) passages.set(boxKey(r.contextBox), r.contextBox); });
       if (selectedPassage) passages.set(boxKey(selectedPassage), selectedPassage);
       const selKey = boxKey(selectedPassage ?? undefined);
+      // Boxes are drawn with the margin the export adds (cropRect), so what
+      // is on screen is what gets exported.
+      const shown = (b: BoundingBox) => { const r = cropRect(b, drawWidth, drawHeight); return { x: r.sx, y: r.sy, w: r.sw, h: r.sh }; };
       passages.forEach((c, key) => {
         const isSel = key === selKey;
+        const pr = shown(c);
         ctx.beginPath();
-        ctx.rect((c.xmin / 1000) * drawWidth, (c.ymin / 1000) * drawHeight, ((c.xmax - c.xmin) / 1000) * drawWidth, ((c.ymax - c.ymin) / 1000) * drawHeight);
+        ctx.rect(pr.x, pr.y, pr.w, pr.h);
         ctx.fillStyle = isSel ? 'rgba(168, 85, 247, 0.18)' : 'rgba(168, 85, 247, 0.10)';
         ctx.fill();
         ctx.lineWidth = isSel ? 2.5 : 1.5;
@@ -525,7 +529,7 @@ export default function App() {
           .map(r => r.questionNumber).sort((x, y) => parseInt(x, 10) - parseInt(y, 10));
         const label = nums.length ? `Passage Q${nums.join(', Q')}` : 'Passage (pick questions)';
         ctx.font = 'bold 11px sans-serif';
-        const tx = (c.xmin / 1000) * drawWidth, ty = (c.ymin / 1000) * drawHeight;
+        const tx = pr.x, ty = pr.y;
         ctx.fillStyle = isSel ? 'rgb(126, 34, 206)' : 'rgba(147, 51, 234, 0.9)';
         ctx.fillRect(tx, ty - 16, ctx.measureText(label).width + 10, 16);
         ctx.fillStyle = '#fff'; ctx.fillText(label, tx + 5, ty - 4);
@@ -533,11 +537,7 @@ export default function App() {
 
       // Draw Questions
       regions.forEach(region => {
-        const { ymin, xmin, ymax, xmax } = region.box;
-        const startX = (xmin / 1000) * drawWidth;
-        const startY = (ymin / 1000) * drawHeight;
-        const width = ((xmax - xmin) / 1000) * drawWidth;
-        const height = ((ymax - ymin) / 1000) * drawHeight;
+        const { x: startX, y: startY, w: width, h: height } = shown(region.box);
 
         ctx.beginPath(); ctx.rect(startX, startY, width, height);
         if (region.isSelected) {
@@ -557,7 +557,10 @@ export default function App() {
 
       // Resize handles on the selected box or passage
       const drawHandles = (box: BoundingBox, color: string) => {
-        handlePoints(box).forEach(([, hx, hy]) => {
+        // (On the drawn outline, which includes the export margin.)
+        const r = shown(box);
+        const outline = { xmin: (r.x / drawWidth) * 1000, ymin: (r.y / drawHeight) * 1000, xmax: ((r.x + r.w) / drawWidth) * 1000, ymax: ((r.y + r.h) / drawHeight) * 1000 };
+        handlePoints(outline).forEach(([, hx, hy]) => {
           const px = (hx / 1000) * drawWidth, py = (hy / 1000) * drawHeight;
           ctx.fillStyle = '#fff'; ctx.strokeStyle = color; ctx.lineWidth = 1.5;
           ctx.fillRect(px - 5, py - 5, 10, 10);

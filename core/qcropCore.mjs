@@ -344,7 +344,33 @@ export const tidyTextWords = (words, W, map) => {
 export const mixedColumns = (map, layout, words, marks = hiddenAnswerMarks(words)) => {
   const W = map.width, H = map.height;
   const [c0, c1] = layout.columns;
-  const top = layout.contentTop, bottom = layout.contentBottom;
+  const top = layout.contentTop;
+  // The footer ("8. SINIF - Türkçe   120   SORU BANKASI", "KONU TESTİ") from
+  // its text: decorative bands around it can hide it from the ink layout.
+  // The lowest lines of the page holding a page number or set in capitals,
+  // below 90% of the page height.
+  let bottom = layout.contentBottom;
+  {
+    const rows = groupLines(words).sort((a, b) => b.bbox.y0 - a.bbox.y0);
+    let footerTop = null, prevTop = null;
+    for (const r of rows) {
+      if (r.bbox.y0 < H * 0.9) break;
+      // (The footer is the bottom line and any line right above it; a
+      // question's last options sit further up.)
+      if (prevTop !== null && prevTop - r.bbox.y1 > H * 0.008) break;
+      prevTop = r.bbox.y0;
+      const t = r.text.trim();
+      const letters = (t.match(/\p{L}/gu) ?? []).length, caps = (t.match(/\p{Lu}/gu) ?? []).length;
+      const footerLike = !/^[A-E]\)/.test(t) && (/(^|\s)\d{1,3}(\s|$)/.test(t) || (letters >= 4 && caps / letters >= 0.6) ||
+        /(^|\s)\p{Lu}{4,}(\s|$)/u.test(t));
+      if (!footerLike) break;
+      footerTop = r.bbox.y0;
+    }
+    if (footerTop !== null) {
+      bottom = Math.min(bottom, Math.round(footerTop - H * 0.006));
+      layout = { ...layout, contentBottom: bottom, footerTop: Math.min(layout.footerTop ?? footerTop, Math.round(footerTop)) };
+    }
+  }
   const inContent = (b) => b.y0 >= top - 2 && b.y1 <= bottom + 2;
   // (A footer's "8. SINIF" is no question number.)
   const labels = labelBoxesFromWords(words).filter(b => inContent(b) && b.y0 < H * 0.93);
@@ -394,9 +420,28 @@ export const mixedColumns = (map, layout, words, marks = hiddenAnswerMarks(words
   }
   // Cells stay within the text's margins: a side tab at the page edge
   // ("CHALLENGE! - 2") never joins a full-width crop.
-  const textRight = Math.max(0, ...words.filter(w => inContent(w.bbox)).map(w => w.bbox.x1));
+  // (Ordinary horizontal words only: tabs and logos set rotated aren't the
+  // text block.)
+  // Lines of three words or more: a tab's few letters aren't one.
+  // (Rows split where a wide gap separates columns or a stray mark.)
+  const textLines = [];
+  for (const l of groupLines(words.filter(w => inContent(w.bbox) && (w.bbox.x1 - w.bbox.x0) > (w.bbox.y1 - w.bbox.y0) * 0.8))) {
+    const h = l.bbox.y1 - l.bbox.y0;
+    let seg = null;
+    const flush = () => { if (seg && seg.n >= 3) textLines.push({ bbox: seg.bbox }); };
+    for (const w of l.words) {
+      if (seg && w.bbox.x0 - seg.bbox.x1 <= h * 3) { seg.n++; seg.bbox = { ...seg.bbox, x1: w.bbox.x1 }; }
+      else { flush(); seg = { n: 1, bbox: { ...w.bbox } }; }
+    }
+    flush();
+  }
+  // (The 5th widest line: a stray letter from a tab can stretch one or two.)
+  const rights = textLines.map(l => l.bbox.x1).sort((a, b) => b - a);
+  const textRight = rights[Math.min(4, rights.length - 1)] ?? 0;
   const xl = lm !== null ? Math.max(layout.columns[0].x0, Math.round(lm - W * 0.012)) : layout.columns[0].x0;
-  const xr = textRight > W * 0.6 ? Math.min(layout.columns[1].x1, Math.round(textRight + W * 0.01)) : layout.columns[1].x1;
+  // (On the right, as far from the edge as the question numbers are on the
+  // left: figures can reach past the text.)
+  const xr = lm !== null ? Math.min(layout.columns[1].x1, Math.round(Math.max(textRight + W * 0.01, W - lm + W * 0.02))) : layout.columns[1].x1;
   layout = { ...layout, columns: [{ ...layout.columns[0], x0: xl }, { ...layout.columns[1], x1: xr }] };
   const [k0, k1] = layout.columns;
 
@@ -445,7 +490,9 @@ export const mixedColumns = (map, layout, words, marks = hiddenAnswerMarks(words
   };
   // Where a full-width question's ink ends: the first blank stretch after
   // its options (the gutter strip, where a vertical logo can sit, aside).
-  const blankRows = Math.round(H * 0.012);
+  // (The same gap that ends a question box: options set above their
+  // pictures, "C) Milyon Ton" over a chart, can leave a line's height free.)
+  const blankRows = Math.round(H * 0.022);
   const endAfter = (y, limit) => {
     let last = Math.round(y), blank = 0;
     for (let yy = Math.round(y); yy < limit; yy++) {
@@ -478,6 +525,19 @@ export const mixedColumns = (map, layout, words, marks = hiddenAnswerMarks(words
     return false;
   };
 
+  // A picture spanning the gutter: rows where ink fills most of a strip
+  // around it (a logo or a dotted divider fills a small part of it).
+  const pictureAcross = (ya, yb) => {
+    const xa = Math.round(gc - W * 0.015), xb = Math.round(gc + W * 0.015);
+    let rows = 0;
+    for (let y = Math.round(ya); y < Math.round(yb); y++) {
+      let n = 0;
+      for (let x = xa, row = y * W; x < xb; x++) n += map.ink[row + x];
+      if (n >= (xb - xa) * 0.6) rows++;
+    }
+    return rows >= H * 0.03;
+  };
+
   const pad = Math.round(H * 0.004);
   const full = [];
   left.forEach((L, i) => {
@@ -504,7 +564,8 @@ export const mixedColumns = (map, layout, words, marks = hiddenAnswerMarks(words
     const sideBySide = rightBlock && !right.some(R => R.y0 < rightBlock.top &&
       (R.y0 > prevLeft || !full.some(r => r.y0 > R.y0 && r.y0 < L.y0))) &&
       !findOptionBlock(leftOwn, L.y0, rightBelow);
-    if (!sideBySide && !own.some(l => l.bbox.y0 < rightBelow && (crossing(l) || (!halfOptions && spread(l)))) && !pictureRow(L, rightBelow)) return;
+    if (!sideBySide && !own.some(l => l.bbox.y0 < rightBelow && (crossing(l) || (!halfOptions && spread(l)))) &&
+      !pictureRow(L, rightBelow) && !(right.length === 0 || !leftBlock ? pictureAcross(L.y0, Math.min(rightBelow, next)) : false)) return;
     const block = findOptionBlock(own, L.y0, next);
     const end = Math.min(rightBelow - pad, block ? Math.min(next - pad, endAfter(block.bottom, next)) : next - pad);
     full.push({ y0: L.y0 - pad, y1: end });
@@ -520,12 +581,83 @@ export const mixedColumns = (map, layout, words, marks = hiddenAnswerMarks(words
     else { run = { y0: l.bbox.y0, y1: l.bbox.y1 }; runs.push(run); }
   }
   for (const r of runs) {
-    const instr = lines.find(l => l.bbox.y1 <= r.y0 + 2 && r.y0 - l.bbox.y1 < H * 0.03 &&
+    // (The instruction may sit in its own box a little above the passage.)
+    const instr = lines.find(l => l.bbox.y1 <= r.y0 + 2 && r.y0 - l.bbox.y1 < H * 0.06 &&
       passageNumbers(l.text) && PASSAGE_VERB_RE.test(l.text));
     full.push({ y0: (instr ? instr.bbox.y0 : r.y0) - pad, y1: r.y1 + pad });
   }
   if (globalThis.__qdbg) console.log('DBG left', left.map(b => Math.round(b.y0)), 'right', right.map(b => Math.round(b.y0)), 'gc', Math.round(gc), 'full', JSON.stringify(full.map(r => [Math.round(r.y0), Math.round(r.y1)])));
-  if (!full.length) return layout;
+  // Vertical logos ("4D Serisi ®" standing in the gutter or the margin):
+  // a narrow, upright, isolated run of ink columns within a two-column
+  // stretch of the page. Crops leave them out.
+  // (Ordinary horizontal text only: a logo's letters stand upright, a
+  // rotated tab's box is taller than a line.)
+  const textXs = textLines.map(l => l.bbox);
+  const textLeft = textXs.length ? Math.min(...textXs.map(b => b.x0)) : 0;
+  const textRightEdge = textXs.length ? textRight : W;
+  // Only in the gutter and the outer margins (narrow upright marks inside a
+  // column are a figure's).
+  // (The outer margins: left of the question numbers, right of where the
+  // page's text would end opposite them.)
+  const marginLeft = Math.min(textLeft, (lm ?? textLeft) - W * 0.005);
+  const marginRight = Math.max(textRightEdge, W - (lm ?? W * 0.08) - W * 0.03);
+  const inMargin = (x) => x < marginLeft || x > marginRight;
+  const inZone = (x) => Math.abs(x - gc) <= W * 0.016 || inMargin(x);
+  // (From the first question number down to the last line of text: a
+  // header band and a band above the footer span every column.)
+  const scanFrom = Math.round(Math.max(top, Math.min(...[...left, ...right].map(b => b.y0), bottom) - pad));
+  const scanTo = Math.min(bottom, Math.max(scanFrom, ...words.filter(w => w.bbox.y1 < bottom).map(w => Math.ceil(w.bbox.y1))));
+  const logoColumns = (ya, yb, marginsOnly = false) => {
+    // (Margins: a little past the band, a logo can stand across its edge.)
+    const ext = marginsOnly ? H * 0.06 : 0;
+    const from = Math.max(marginsOnly ? top : scanFrom, Math.round(ya - ext)), to = Math.min(scanTo, Math.round(yb + ext));
+    const out = [];
+    if (to - from < H * 0.05) return out;
+    const colTop = new Int32Array(W).fill(-1), colBot = new Int32Array(W).fill(-1);
+    for (let y = from; y < to; y++) {
+      for (let x = 0, row = y * W; x < W; x++) {
+        if (!map.ink[row + x]) continue;
+        if (colTop[x] < 0) colTop[x] = y;
+        colBot[x] = y;
+      }
+    }
+    // A divider line (a long column whose neighbours a few px away are not
+    // long, solid or dotted) counts as empty: the logo can stand on it.
+    const long = (x) => x >= 0 && x < W && colTop[x] >= 0 && colBot[x] - colTop[x] > (to - from) * 0.5;
+    // (A line: up to 6 neighbouring long columns.)
+    const rule = [];
+    for (let x = 0; x < W; x++) {
+      if (!long(x) || long(x - 1)) continue;
+      let x1 = x;
+      while (long(x1 + 1)) x1++;
+      if (x1 - x < 6) for (let k = x; k <= x1; k++) rule.push(k);
+    }
+    for (const x of rule) colTop[x] = -1;
+    const zone = (x) => marginsOnly ? inMargin(x) : inZone(x);
+    // (Divider lines in the gutter or a margin stay out of crops too.)
+    for (const x of rule) if (zone(x)) out.push(x);
+    // Runs of inked columns, bridging the divider's empty columns.
+    const blankGap = Math.round(W * 0.006);
+    const runs = [];
+    for (let x = 0; x < W; x++) {
+      if (colTop[x] < 0) continue;
+      const r = runs[runs.length - 1];
+      if (r && x - r.x1 <= 3) r.x1 = x; else runs.push({ x0: x, x1: x });
+    }
+    runs.forEach((r, i) => {
+      const w = r.x1 - r.x0 + 1;
+      let y0 = Infinity, y1 = -1;
+      for (let k = r.x0; k <= r.x1; k++) if (colTop[k] >= 0) { y0 = Math.min(y0, colTop[k]); y1 = Math.max(y1, colBot[k]); }
+      const h = y1 - y0 + 1;
+      const isolated = (!runs[i - 1] || r.x0 - runs[i - 1].x1 > blankGap) && (!runs[i + 1] || runs[i + 1].x0 - r.x1 > blankGap);
+      if (w <= W * 0.02 && h <= H * 0.15 && h >= w * 3 && isolated && zone(r.x0) && zone(r.x1)) {
+        for (let k = r.x0; k <= r.x1; k++) out.push(k);
+      }
+    });
+    return out;
+  };
+  let ignoreX = [];
+  if (!full.length) return { ...layout, ignoreX: [...new Set([...logoColumns(top, bottom), ...logoColumns(top, bottom, true)])] };
 
   full.sort(byY);
   const merged = [];
@@ -535,14 +667,19 @@ export const mixedColumns = (map, layout, words, marks = hiddenAnswerMarks(words
   }
   const columns = [];
   let y = top;
-  const twoCol = (y0, y1) => { if (y1 - y0 > H * 0.01) columns.push({ ...k0, y0, y1 }, { ...k1, y0, y1 }); };
+  const twoCol = (y0, y1) => {
+    if (y1 - y0 <= H * 0.01) return;
+    columns.push({ ...k0, y0, y1 }, { ...k1, y0, y1 });
+    ignoreX.push(...logoColumns(y0, y1), ...logoColumns(y0, y1, true));
+  };
   for (const r of merged) {
     twoCol(y, r.y0);
     columns.push({ x0: k0.x0, x1: k1.x1, y0: Math.max(top, r.y0), y1: Math.min(bottom, r.y1), full: true });
+    ignoreX.push(...logoColumns(r.y0, r.y1, true));
     y = r.y1;
   }
   twoCol(y, bottom);
-  return { ...layout, columns };
+  return { ...layout, columns, ignoreX: [...new Set(ignoreX)] };
 };
 
 /**
@@ -1271,7 +1408,8 @@ export const optionlessStrips = (params) => labelStrips(params)
 export const capHeightFromStrips = (strips, H, fromTextLayer) => {
   const hs = strips.map(s => s.labelH).filter(h => h > 0).sort((a, b) => a - b);
   if (!hs.length) return H * 0.0105;
-  return hs[hs.length >> 1] * (fromTextLayer ? 0.62 : 1);
+  // (The lower middle: a header badge's big number can be among them.)
+  return hs[(hs.length - 1) >> 1] * (fromTextLayer ? 0.62 : 1);
 };
 
 /**
@@ -1357,6 +1495,7 @@ export const findQuestions = (params) => {
     const col = layout.columns[q.col];
     const bodyX0 = q.labelRight + Math.round(W * 0.004);
     const rules = verticalRules(map, col.x0, q.stripTop, col.x1 + 1, q.options.bottom);
+    for (const x of layout.ignoreX ?? []) rules.add(x);
     // Margin strip: from the question's own label to just left of the option
     // letters (empty when options sit at the margin themselves).
     const optX0 = Number.isFinite(q.options.x0) ? q.options.x0 : bodyX0;
@@ -1370,6 +1509,14 @@ export const findQuestions = (params) => {
     const labelBottom = Math.max(q.y1 ?? q.y0, q.y0 + H * 0.008);
     const below = inkBounds(map, q.x0 - W * 0.004, labelBottom + 2, col.x1 + 1, endY, rules);
     let mask;
+    // The crop's left margin (see cropRect) can reach the number's edge.
+    if (q.labelRight > bounds.x0 - W * 0.006) {
+      const p = H * 0.003;
+      mask = {
+        xmin: scale1000(q.x0 - p, W), ymin: scale1000(q.y0 - p, H),
+        xmax: scale1000(q.labelRight + p, W), ymax: scale1000(labelBottom + p, H),
+      };
+    }
     if (below && below.x0 < bounds.x0) {
       bounds.x0 = below.x0;
       if (bounds.x0 < q.labelRight) {
@@ -1480,7 +1627,7 @@ export const instructionFromBand = (lines, band) => {
  * cevaplandırınız."). Wording ("aşağıdaki"/"yukarıdaki") isn't trusted:
  * books use both for either layout. Adds `contextBox` to those regions.
  */
-const attachPassages = ({ map, layout, columnLines, passageLines }, regions) => {
+const attachPassages = ({ map, layout, columnLines, passageLines, passageWithInstruction }, regions) => {
   if (!regions.length) return;
   const W = map.width, H = map.height;
   const pad = Math.round(H * 0.004);
@@ -1546,7 +1693,21 @@ const attachPassages = ({ map, layout, columnLines, passageLines }, regions) => 
       const below = first.q.col === colIdx ? first.q.y0 - pad : col.full ? first.q.y0 - pad : Math.min(col.y1 ?? layout.contentBottom,
         ...regions.filter(r => r.q.col === colIdx && r.q.y0 > line.bbox.y1).map(r => r.q.y0 - pad));
       const rules = verticalRules(map, col.x0, y, x1, Math.max(y + 1, below));
+      for (const x of layout.ignoreX ?? []) rules.add(x);
       let bounds = below - y > H * 0.02 ? inkBounds(map, x0, y, x1, below, rules) : null;
+      // Mixed layouts: an instruction ending its column with the questions
+      // further down, under a full-width passage: the passage is whatever
+      // spans the page between them.
+      if ((!bounds || bounds.y1 - bounds.y0 < H * 0.02) && col.y0 !== undefined && first.q.col !== colIdx) {
+        const wx0 = Math.min(...layout.columns.map(c => c.x0)), wx1 = Math.max(...layout.columns.map(c => c.x1)) + 1;
+        const end = first.q.y0 - pad;
+        if (end - y > H * 0.02) {
+          const wide = verticalRules(map, wx0, y, wx1, end);
+          for (const x of layout.ignoreX ?? []) wide.add(x);
+          const b = inkBounds(map, wx0, y, wx1, end, wide);
+          if (b && b.y1 - b.y0 >= H * 0.02) bounds = b;
+        }
+      }
       if (!bounds || bounds.y1 - bounds.y0 < H * 0.02) {
         // Passage above: from the end of the previous question in this
         // column (or the column top) to the instruction.
@@ -1555,8 +1716,28 @@ const attachPassages = ({ map, layout, columnLines, passageLines }, regions) => 
           .map(r => r.q.y1 + pad));
         const top = line.bbox.y0 - pad;
         if (top - prevEnd < H * 0.02) return;
-        bounds = inkBounds(map, x0, prevEnd, x1, top, verticalRules(map, col.x0, prevEnd, x1, top));
+        const above = verticalRules(map, col.x0, prevEnd, x1, top);
+        for (const x of layout.ignoreX ?? []) above.add(x);
+        bounds = inkBounds(map, x0, prevEnd, x1, top, above);
         if (!bounds || bounds.y1 - bounds.y0 < H * 0.02) return;
+      }
+      // Profiles with `passageWithInstruction`: the instruction (and the
+      // banner it's printed on) opens the passage crop.
+      // (Only an instruction printed on a filled banner: a plain line of
+      // instruction stays out, as in the books' other passages.)
+      const onBanner = () => {
+        let n = 0, all = 0;
+        for (let yy = Math.round(line.bbox.y0); yy < Math.round(line.bbox.y1); yy++) {
+          for (let xx = Math.round(line.bbox.x0); xx < Math.round(line.bbox.x1); xx += 2) { all++; n += (map.light ?? map.ink)[yy * W + xx]; }
+        }
+        return all > 0 && n / all > 0.4;
+      };
+      if (passageWithInstruction && bounds.y0 > line.bbox.y0 && onBanner()) {
+        let ytop = Math.floor(line.bbox.y0);
+        while (ytop > 0 && line.bbox.y0 - ytop < H * 0.03 && rowInk(ytop - 1)) ytop--;
+        const lx0 = Math.min(x0, Math.floor(line.bbox.x0)), lx1 = Math.max(x1, Math.ceil(line.bbox.x1));
+        const band = inkBounds(map, lx0, ytop, lx1, Math.ceil(instrBottom) + 2, new Set(layout.ignoreX ?? []));
+        if (band) bounds = { x0: Math.min(bounds.x0, band.x0), y0: band.y0, x1: Math.max(bounds.x1, band.x1), y1: bounds.y1 };
       }
       const contextBox = {
         xmin: scale1000(bounds.x0, W), ymin: scale1000(bounds.y0, H),
@@ -2723,7 +2904,9 @@ export const sanitizeName = (str) => str
  * at any render resolution.
  */
 export const cropRect = (box, W, H) => {
-  const pX = W * 0.005, pY = H * 0.005, lP = W * 0.002;
+  // (The same margin on the left as on the right: users widened crops that
+  // started right at the text. A question number it reaches is masked.)
+  const pX = W * 0.005, pY = H * 0.005, lP = W * 0.005;
   const sx = Math.round(Math.max(0, (box.xmin / 1000) * W - lP));
   const sy = Math.round(Math.max(0, (box.ymin / 1000) * H - pY));
   const sw = Math.round(Math.min(W - sx, ((box.xmax - box.xmin) / 1000) * W + lP + pX));

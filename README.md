@@ -52,7 +52,9 @@ is processing: browsers pause PDF page rendering in background tabs.
 
 ## Fixing crops by hand (web app)
 
-- **Boxes**: drag a box to move it, drag its handles to resize it, and use
+- **Boxes** are drawn with the margin the export adds around them, so the
+  outline on the page is exactly what the exported image will show. Drag a
+  box to move it, drag its handles to resize it, and use
   **Add Box** to draw a missed question. To drop a crop, use its trash icon
   or select its box on the page and press Delete/Backspace (for example a
   question whose shared passage is on the previous page). A new box is numbered from where it
@@ -284,6 +286,12 @@ table of contents: `<unit>_ünite_<topic>_<test>_q<N>_s<page>.jpg`, e.g.
 `dene_testi_1_q5_s52.jpg`. Atom books have no contents pages; their header
 gives the test number and topic: `test01_metni_görsellerle_yorumlama_q1_s1.jpg`.
 The English book's units are named the same way (`1_unit_friendship_remember_1_…`).
+
+Page furniture is kept out of crops: the footer ("8. SINIF - Türkçe",
+"KONU TESTİ") is found from its text, and the vertical "4D Serisi ®" logo
+and divider lines in the gutter or the margins are ignored. For Atom
+books, a shared passage's crop starts with its instruction banner ("6 – 8:
+FOR THESE QUESTIONS, CHOOSE ...") when the instruction is printed on one.
 
 Every answer comes from the book's printed answer key (`4d`) or, for Atom
 books, from the answer hidden at each question; where the two disagree
