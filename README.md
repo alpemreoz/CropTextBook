@@ -16,11 +16,15 @@ Prerequisites: Node.js
 
 ```bash
 npm install
-npm run dev
+npm start
 ```
 
-Then open the printed URL, select page scans (JPEG/PNG/WebP) or a PDF, and
-export. On first use Tesseract downloads its Turkish language data (~10 MB,
+`npm start` builds the app and opens it in the browser
+(http://localhost:3000). Use it for cropping; `npm run dev` is for working
+on the code (it reloads the page whenever its connection to the dev server
+drops, e.g. after the computer sleeps).
+
+Select page scans (JPEG/PNG/WebP) or a PDF, and export. On first use Tesseract downloads its Turkish language data (~10 MB,
 cached by the browser afterwards). Keep the tab in the foreground while a PDF
 is processing: browsers pause PDF page rendering in background tabs.
 
@@ -73,6 +77,20 @@ is processing: browsers pause PDF page rendering in background tabs.
   the previous/next page; picking a page on the left scrolls the crop list
   to that page; clicking a box on the page scrolls to its crop.
 
+## Saved work
+
+The app saves the opened books and everything found and corrected on their
+pages in the browser (IndexedDB), a second after each change. If the page
+reloads (the computer woke from sleep, the browser crashed, the tab was
+closed), the start screen offers **Continue where you left off?**: pages
+analyzed before come back with their crops, numbers and passages as they
+were (they are only rendered again, not analyzed again), and the rest are
+analyzed. **Start over** or opening new files forgets the saved work, as
+does **Reset App**. Nothing leaves the computer.
+
+While pages are analyzed or exported, the app keeps the screen on so the
+computer doesn't sleep in the middle (where the browser supports it).
+
 ## Edit log (training data)
 
 The web app records what it detected on each page and every correction
@@ -97,6 +115,10 @@ button.
 - `page_viewed` (time spent, whether anything was changed): a page looked
   at and left unchanged counts as one the program got right.
 - `export` and `page_final`: every page's final crops at export.
+- `session_restored`, `session_discarded`: saved work continued after a
+  reload, or dropped (see Saved work). A restored page is not logged as
+  `page_analyzed` again; corrections on it still compare against what was
+  detected originally.
 
 Boxes are in 0–1000 page units (thousandths of the page width/height), so
 `"bottom": -25` means the bottom edge was moved up by 2.5% of the page.

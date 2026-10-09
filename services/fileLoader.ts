@@ -16,6 +16,8 @@ export interface PdfTextItem {
 
 export interface PdfPageRef {
   source: string;
+  /** The PDF file itself (saved for restoring the session). */
+  file: File;
   pageIndex: number;
   load: () => Promise<{ dataUrl: string; textItems: PdfTextItem[] }>;
   /** Page size in pixels at `dpi`. */
@@ -100,7 +102,7 @@ const expandPdf = async (file: File): Promise<LoadedPage[]> => {
     // as-is (s<index>), never parsed back out of the filename.
     file: new File([], `${baseName} (p${k + 1}).jpg`, { type: 'image/jpeg' }),
     pdf: {
-      source: file.name, pageIndex: k + 1, load: () => load(k + 1),
+      source: file.name, file, pageIndex: k + 1, load: () => load(k + 1),
       size: (dpi: number) => size(k + 1, dpi),
       renderRegion: (dpi: number, r: { sx: number; sy: number; sw: number; sh: number }) => renderRegion(k + 1, dpi, r),
     },

@@ -7,6 +7,7 @@ import { PROFILES, profileOptions } from './core/profiles.mjs';
 import { QuestionRegion, AppStatus, BoundingBox, PageData } from './types';
 import { LoaderIcon, DownloadIcon, ScissorsIcon, TrashIcon, PlusIcon, ChevronLeftIcon, ChevronRightIcon } from './components/Icons';
 import { logEvent, logSessionStart, roundBox, edgeDelta, sameBox } from './services/editLog';
+import { fileKey, saveFiles, saveSession, loadSession, clearSession } from './services/sessionStore';
 
 type ResizeHandle = 'nw' | 'n' | 'ne' | 'e' | 'se' | 's' | 'sw' | 'w';
 
@@ -31,6 +32,37 @@ const bookOf = (p: PageData): { key: string; order: number } | null => {
   const seq = imageSequence(p.file.name);
   return seq ? { key: `img:${seq.key}`, order: seq.index } : null;
 };
+
+// --- Saved session (services/sessionStore.ts) --------------------------------
+
+/** Page results kept in the saved session; the image and crops are rebuilt. */
+const SAVED_FIELDS = ['pageNumber', 'pageLabel', 'testNumber', 'topic', 'coverTopic', 'section', 'week',
+  'weekUnsure', 'weekGlyphs', 'answers', 'plainTopic', 'marked', 'contents'] as const;
+
+type Detected = { box: BoundingBox; n: string; passage?: BoundingBox };
+
+interface SavedPage {
+  id: string;
+  fileKey: string;
+  pdfPage?: number;
+  /** Analyzed: `fields` and `regions` hold its results. Otherwise it is analyzed again. */
+  done: boolean;
+  fields: Partial<PageData>;
+  regions: QuestionRegion[];
+  /** What detection found per region, for the edit log. */
+  detected: [string, Detected][];
+  edited: boolean;
+}
+
+interface SavedSession {
+  savedAt: string;
+  profile: string;
+  activePageId: string | null;
+  pages: SavedPage[];
+}
+
+/** The file a page was opened from: the PDF, or the image itself. */
+const sourceFile = (p: { file: File; pdf?: { file: File } }) => p.pdf ? p.pdf.file : p.file;
 
 const boxKey = (b?: BoundingBox) => b ? `${b.xmin},${b.ymin},${b.xmax},${b.ymax}` : '';
 
@@ -68,7 +100,7 @@ export default function App() {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   // Edit log: what detection produced per region (to tell corrections of
   // detected boxes from boxes drawn by hand), and pages edited since.
-  const detectedRef = useRef(new Map<string, { box: BoundingBox; n: string; passage?: BoundingBox }>());
+  const detectedRef = useRef(new Map<string, Detected>());
   const editedPagesRef = useRef(new Set<string>());
   const containerRef = useRef<HTMLDivElement>(null);
   const [containerSize, setContainerSize] = useState({ w: 0, h: 0 });
@@ -94,6 +126,63 @@ export default function App() {
   }, [profile]);
   const [exportProgress, setExportProgress] = useState<string | null>(null);
   const dragRef = useRef<DragState | null>(null);
+
+  // Saved session: work is saved in this browser as it goes, so a reload
+  // (the computer waking from sleep, a crash, a closed tab) can continue
+  // from it. `saved` is the session found at start, until the user picks.
+  const [saved, setSaved] = useState<{ snapshot: SavedSession; files: Map<string, File> } | null>(null);
+  const [restoring, setRestoring] = useState(false);
+  useEffect(() => {
+    loadSession<SavedSession>().then(s => { if (s?.snapshot.pages?.length) setSaved(s); });
+  }, []);
+
+  // Pages, results and corrections are saved a second after each change.
+  useEffect(() => {
+    if (pages.length === 0) return;
+    const timer = setTimeout(() => {
+      const snapshot: SavedSession = {
+        savedAt: new Date().toISOString(),
+        profile,
+        activePageId,
+        pages: pages.map(p => {
+          const done = p.status === 'READY' || !!p.restored;
+          const fields = p.restored?.fields ?? Object.fromEntries(SAVED_FIELDS.map(k => [k, p[k]]));
+          const regions = (p.restored?.regions ?? p.regions).map(({ croppedDataUrl, isSelected, ...r }) => r);
+          return {
+            id: p.id, fileKey: fileKey(sourceFile(p)), pdfPage: p.pdf?.pageIndex, done,
+            fields: done ? fields : {}, regions: done ? regions : [],
+            detected: regions.flatMap(r => { const d = detectedRef.current.get(r.id); return d ? [[r.id, d] as [string, Detected]] : []; }),
+            edited: editedPagesRef.current.has(p.id),
+          };
+        }),
+      };
+      saveSession(snapshot).catch(() => { /* storage unavailable */ });
+    }, 1000);
+    return () => clearTimeout(timer);
+  }, [pages, activePageId, profile]);
+
+  // Keeps the screen on while pages are analyzed or exported, so the
+  // computer doesn't go to sleep in the middle (where the browser allows it).
+  const busy = isProcessing || !!exportProgress;
+  useEffect(() => {
+    const wl = (navigator as any).wakeLock;
+    if (!busy || !wl) return;
+    let lock: any = null, done = false;
+    const take = async () => {
+      if (done || lock || document.visibilityState !== 'visible') return;
+      try {
+        const l = await wl.request('screen');
+        if (done) { l.release(); return; }
+        lock = l;
+        l.addEventListener('release', () => { if (lock === l) lock = null; });
+      } catch { /* not allowed (e.g. low battery) */ }
+    };
+    // The browser drops the lock when the tab is hidden; take it again on return.
+    const onVisible = () => { if (document.visibilityState === 'visible') take(); };
+    take();
+    document.addEventListener('visibilitychange', onVisible);
+    return () => { done = true; document.removeEventListener('visibilitychange', onVisible); lock?.release().catch(() => {}); };
+  }, [busy]);
 
   // Drawing tools and the passage panel belong to the page they were used on.
   useEffect(() => { setTool('select'); setSelectedPassage(null); setDraftBox(null); }, [activePageId]);
@@ -347,10 +436,61 @@ export default function App() {
     }));
 
     setPages(prev => [...prev, ...newPages]);
+    // New work replaces any saved session; the opened files are kept for restoring.
+    setSaved(null);
+    const files = [...new Map(newFiles.map(f => [fileKey(sourceFile(f)), sourceFile(f)])).values()];
+    clearSession().catch(() => {});
+    saveFiles(files).catch(() => {});
     logEvent('files_added', { profile, files: [...new Set(newFiles.map(f => f.file.name))], pages: newFiles.length });
     if (!activePageId) setActivePageId(newPages[0].id);
     setIsProcessing(true);
   }, [activePageId]);
+
+  /** Opens the saved session again: pages analyzed before keep their results and corrections. */
+  const restoreSession = async () => {
+    if (!saved || restoring) return;
+    setRestoring(true);
+    const { snapshot, files } = saved;
+    try {
+      const loaded = new Map<string, LoadedPage[]>();
+      for (const [key, f] of files) loaded.set(key, await expandFiles([f]));
+      const restored: PageData[] = [];
+      for (const sp of snapshot.pages) {
+        const lp = loaded.get(sp.fileKey)?.find(l => sp.pdfPage === undefined || l.pdf?.pageIndex === sp.pdfPage);
+        if (!lp) continue;
+        restored.push({
+          id: sp.id, file: lp.file, dataUrl: lp.dataUrl, pdf: lp.pdf, imageObj: null,
+          status: 'IDLE', regions: [], pageNumber: (sp.done && sp.fields.pageNumber) || '...',
+          restored: sp.done ? { fields: sp.fields, regions: sp.regions } : undefined,
+        });
+        for (const [rid, d] of sp.detected) detectedRef.current.set(rid, d);
+        if (sp.edited) editedPagesRef.current.add(sp.id);
+      }
+      logEvent('session_restored', {
+        profile: snapshot.profile, savedAt: snapshot.savedAt, pages: restored.length,
+        analyzed: restored.filter(p => p.restored).length, missing: snapshot.pages.length - restored.length,
+      });
+      if (!restored.length) {
+        window.alert('The saved work could not be opened (its files are missing). Please open the book again.');
+        clearSession().catch(() => {});
+      } else {
+        setProfile(snapshot.profile in PROFILES ? snapshot.profile : '');
+        setPages(restored);
+        setActivePageId(restored.some(p => p.id === snapshot.activePageId) ? snapshot.activePageId : restored[0].id);
+        setIsProcessing(true);
+      }
+    } catch (err: any) {
+      window.alert(`The saved work could not be opened: ${err?.message ?? err}`);
+    }
+    setSaved(null);
+    setRestoring(false);
+  };
+
+  const discardSession = () => {
+    logEvent('session_discarded', { savedAt: saved?.snapshot.savedAt, pages: saved?.snapshot.pages.length });
+    setSaved(null);
+    clearSession().catch(() => {});
+  };
 
   // Dev-only hook: lets automated tests feed sample pages without the file picker.
   useEffect(() => {
@@ -401,6 +541,18 @@ export default function App() {
         img.onload = resolve;
         img.onerror = reject;
       });
+
+      // A page from a saved session: its results (and corrections) are kept,
+      // only the image and crops are made again.
+      if (pendingPage.restored) {
+        const { fields, regions } = pendingPage.restored;
+        inFlight.current.delete(pendingPage.id);
+        setPages(prev => prev.map(p => p.id === pendingPage.id ? {
+          ...p, ...fields, status: 'READY', dataUrl, imageObj: img, restored: undefined,
+          regions: regions.map(r => ({ ...r, croppedDataUrl: cropImage(img, r.box, r.contextBox, r.mask) })),
+        } : p));
+        return;
+      }
 
       const result = await analyzeTestPageLocal(img, textItems, { bookPage: !!bookOf(pendingPage), profile });
 
@@ -1003,7 +1155,7 @@ export default function App() {
                 logEvent('profile_changed', { from: profile, to: next, pages: pages.length });
                 setProfile(next);
                 if (pages.length > 0) {
-                  setPages(prev => prev.map(p => ({ ...p, status: 'IDLE', regions: [] })));
+                  setPages(prev => prev.map(p => ({ ...p, status: 'IDLE', regions: [], restored: undefined })));
                   setIsProcessing(true);
                 }
               }}
@@ -1015,7 +1167,7 @@ export default function App() {
             </select>
           </label>
           {pages.length > 0 && (
-            <button onClick={() => { logEvent('reset', { profile, pages: pages.length }); setPages([]); setActivePageId(null); }} className="px-5 py-2.5 text-sm font-black text-slate-600 hover:text-red-600 bg-slate-100 hover:bg-red-50 rounded-xl transition-all uppercase tracking-widest">
+            <button onClick={() => { logEvent('reset', { profile, pages: pages.length }); setPages([]); setActivePageId(null); clearSession().catch(() => {}); }} className="px-5 py-2.5 text-sm font-black text-slate-600 hover:text-red-600 bg-slate-100 hover:bg-red-50 rounded-xl transition-all uppercase tracking-widest">
               Reset App
             </button>
           )}
@@ -1024,7 +1176,35 @@ export default function App() {
 
       <main className="flex-1 flex overflow-hidden">
         {pages.length === 0 ? (
-           <Uploader onImagesSelected={handleImagesSelected} isLoading={false} />
+          <div className="flex-1 flex flex-col min-h-0">
+            {saved && (() => {
+              const sp = saved.snapshot.pages;
+              const books = [...new Set(sp.map(p => p.fileKey.split('|')[0]))];
+              const crops = sp.reduce((n, p) => n + p.regions.length, 0);
+              const analyzed = sp.filter(p => p.done).length;
+              const when = new Date(saved.snapshot.savedAt).toLocaleString();
+              return (
+                <div className="mx-8 mt-8 p-6 bg-white border-2 border-brand-300 rounded-3xl shadow-xl shadow-slate-200/50 flex items-center gap-6">
+                  <div className="flex-1 min-w-0">
+                    <p className="font-black text-slate-800 text-lg">Continue where you left off?</p>
+                    <p className="text-slate-500 text-sm truncate" title={books.join(', ')}>
+                      {books.join(', ')}: {analyzed} of {sp.length} pages analyzed, {crops} crops, with your corrections. Saved {when}.
+                    </p>
+                  </div>
+                  <button onClick={discardSession} disabled={restoring} className="px-5 py-2.5 text-sm font-black text-slate-600 hover:text-red-600 bg-slate-100 hover:bg-red-50 rounded-xl transition-all uppercase tracking-widest disabled:opacity-50">
+                    Start over
+                  </button>
+                  <button onClick={restoreSession} disabled={restoring} className="px-6 py-2.5 text-sm font-black text-white bg-brand-600 hover:bg-brand-700 rounded-xl shadow-lg shadow-brand-200 transition-all uppercase tracking-widest flex items-center gap-2 disabled:opacity-70">
+                    {restoring && <LoaderIcon className="w-4 h-4 animate-spin" />}
+                    Continue
+                  </button>
+                </div>
+              );
+            })()}
+            <div className="flex-1 min-h-0">
+              <Uploader onImagesSelected={handleImagesSelected} isLoading={restoring} />
+            </div>
+          </div>
         ) : (
           <div className="flex-1 flex w-full h-full">
             
@@ -1110,7 +1290,7 @@ export default function App() {
                       <div className="absolute inset-0 bg-white/40 backdrop-blur-sm flex items-center justify-center z-10">
                          <div className="bg-white px-8 py-5 rounded-3xl shadow-2xl flex items-center gap-4">
                            <LoaderIcon className="w-6 h-6 text-brand-600" />
-                           <span className="font-black text-slate-800 text-sm uppercase tracking-widest">AI Scanning Page {activePage.pageNumber}</span>
+                           <span className="font-black text-slate-800 text-sm uppercase tracking-widest">{activePage.restored ? 'Restoring' : 'Analyzing'} Page {activePage.pageNumber}</span>
                          </div>
                       </div>
                     )}

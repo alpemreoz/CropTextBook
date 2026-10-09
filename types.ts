@@ -43,6 +43,8 @@ export interface PageData {
   contents?: any; // what the book's contents need from this page (bookIndex)
   pdf?: PdfPageRef;
   error?: string;
+  /** Results from a saved session: the page is rendered again, not analyzed. */
+  restored?: { fields: Partial<PageData>; regions: QuestionRegion[] };
 }
 
 export type AppStatus = 'IDLE' | 'ANALYZING' | 'READY' | 'ERROR';
