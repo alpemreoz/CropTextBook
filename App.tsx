@@ -2,7 +2,7 @@ import React, { useState, useEffect, useRef, useCallback, useMemo } from 'react'
 import Uploader from './components/Uploader';
 import { analyzeTestPageLocal } from './services/localAnalyzer';
 import { expandFiles, LoadedPage, PDF_EXPORT_DPI } from './services/fileLoader';
-import { cropFileName, resolveTopics, resolveWeeks, imageSequence, cropRect, maskRect, stackLayout, checkAnswers, testSegments, majority, bookContents, contentsTestName, checkAgainstKey } from './core/qcropCore.mjs';
+import { cropFileName, resolveTopics, resolveWeeks, imageSequence, cropRect, maskRect, stackLayout, checkAnswers, testSegments, majority, bookContents, contentsTestName, checkAgainstKey, checkLabelsAgainstKey, carryTestLabels } from './core/qcropCore.mjs';
 import { PROFILES, profileOptions } from './core/profiles.mjs';
 import { QuestionRegion, AppStatus, BoundingBox, PageData } from './types';
 import { LoaderIcon, DownloadIcon, ScissorsIcon, TrashIcon, PlusIcon, ChevronLeftIcon, ChevronRightIcon } from './components/Icons';
@@ -37,7 +37,7 @@ const bookOf = (p: PageData): { key: string; order: number } | null => {
 
 /** Page results kept in the saved session; the image and crops are rebuilt. */
 const SAVED_FIELDS = ['pageNumber', 'pageLabel', 'testNumber', 'topic', 'coverTopic', 'section', 'week',
-  'weekUnsure', 'weekGlyphs', 'answers', 'plainTopic', 'marked', 'contents'] as const;
+  'weekUnsure', 'weekGlyphs', 'answers', 'plainTopic', 'marked', 'contents', 'testLabel'] as const;
 
 type Detected = { box: BoundingBox; n: string; passage?: BoundingBox };
 
@@ -311,23 +311,29 @@ export default function App() {
     }
     for (const group of byBook.values()) {
       const total = pages.filter(p => p.pdf?.source === group[0].pdf!.source).length;
-      const contents = bookContents(group.map(p => ({ pdfPage: p.pdf!.pageIndex, ...p.contents })), total);
-      const check = checkAgainstKey(contents, group.map(p => ({
-        pdfPage: p.pdf!.pageIndex, questions: p.regions.map(r => parseInt(r.questionNumber, 10)).filter(n => !isNaN(n)),
-      })));
+      const holdTests = !!profileOptions(profile).headerTest;
+      const contents = bookContents(group.map(p => ({ pdfPage: p.pdf!.pageIndex, ...p.contents })), total, { entriesHoldTests: holdTests });
+      // (Entries holding several tests: each page's own test is found in the key.)
+      group.sort((a, b) => a.pdf!.pageIndex - b.pdf!.pageIndex);
+      const labels = holdTests ? carryTestLabels(group.map(p => ({ label: p.testLabel, entry: contents.testAt(p.pdf!.pageIndex) }))) : [];
+      const labelOf = new Map(group.map((p, k) => [p.id, labels[k]]));
+      const crops = group.map(p => ({
+        pdfPage: p.pdf!.pageIndex, label: labelOf.get(p.id), questions: p.regions.map(r => parseInt(r.questionNumber, 10)).filter(n => !isNaN(n)),
+      }));
+      const check: any = holdTests ? checkLabelsAgainstKey(contents, crops) : checkAgainstKey(contents, crops);
       const ready = new Set(group.map(p => p.pdf!.pageIndex));
       for (const p of group) {
         const t: any = contents.tests[contents.testAt(p.pdf!.pageIndex)];
         if (!t) continue;
-        nameOf.set(p.id, contentsTestName(t));
+        nameOf.set(p.id, [contentsTestName(t), labelOf.get(p.id)].filter(Boolean).join(' '));
         for (const r of p.regions) {
           const letter = check.answerOf(p.pdf!.pageIndex, parseInt(r.questionNumber, 10));
           if (letter) answerOf.set(r.id, letter);
         }
         // Only once every page of the test is in.
-        const rep = check.report.find((x: any) => x.test === t);
+        const rep = check.report.find((x: any) => holdTests ? p.pdf!.pageIndex >= x.start && p.pdf!.pageIndex <= x.end : x.test === t);
         let all = true;
-        for (let pg = t.start; pg <= t.end; pg++) if (!ready.has(pg)) all = false;
+        for (let pg = rep?.start ?? t.start; pg <= (rep?.end ?? t.end); pg++) if (!ready.has(pg)) all = false;
         if (rep && all && rep.missing.length) missingOn.set(p.id, rep.missing);
       }
     }
@@ -617,6 +623,7 @@ export default function App() {
         plainTopic: result.plainTopic,
         marked: result.marked,
         contents: result.contents,
+        testLabel: result.testLabel,
         regions: regionsWithData
       } : p));
     } catch (err: any) {

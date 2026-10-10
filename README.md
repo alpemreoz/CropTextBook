@@ -233,7 +233,7 @@ npm run rename -- apotemi_crops --book ~/Downloads/demo_books/20261003171555338.
 One book per crop folder. Example names: `1_bölüm_gerçek_sayılar_test2_q1_s15.jpg`,
 `bölüm_6_çarpanlara_ayırma_denklem_çözme_q3_s146.jpg`.
 
-## Book profiles (scanned question banks)
+## Book profiles
 
 Some books need settings the default analysis doesn't use: scanned question
 banks with no header banner on half their pages, spine text in the margin,
@@ -259,6 +259,9 @@ it analyzes the loaded pages again.
 | `apotemi` | Apotemi – TYT Matematik Soru Bankası |
 | `4d` | 4D Serisi (NEV) – 8. Sınıf Soru Bankası (all subjects) |
 | `atom` | Atom – 8. Sınıf Konu Testleri (all subjects) |
+| `4d-ayt` | 4D Serisi (NEV) – AYT Soru Bankası (Fizik) |
+| `4d-ayt-biyoloji` | 4D Serisi (NEV) – AYT Biyoloji Soru Bankası |
+| `yeniyorum` | Yeniyorum – 8. Sınıf Fen Bilimleri Soru Bankası |
 
 What a profile can switch on (see `core/profiles.mjs`, where each profile
 lists only what differs from the defaults):
@@ -298,6 +301,11 @@ lists only what differs from the defaults):
   answer where no answer key does.
 - `titleFromHeader`: the test number and topic printed together in the
   header ("1  Metni Görsellerle Yorumlama") name the test's crops.
+- `headerTest` (with `bookIndex`): contents entries that hold several
+  tests, each starting over at question 1. The page's own test from its
+  header ("TEST-1"; or a number over one of the profile's words, "01" /
+  "Pekiştir") is added to the entry's name, the answer key is matched by it
+  within the unit, and the contents' pages are placed by the page footers.
 
 ### Grade-8 books (`4d`, `atom`)
 
@@ -321,6 +329,30 @@ books, from the answer hidden at each question; where the two disagree
 them. Things the text layer can't help with: a question printed entirely
 as a picture (no text at all) isn't found, and two-column passages beside
 an image-only figure may need a hand-drawn passage box.
+
+### AYT books (`4d-ayt`, `4d-ayt-biyoloji`) and Yeniyorum (`yeniyorum`)
+
+Options run A)–E) (A)–D) for Yeniyorum). All three are named from their
+table of contents, as `4d` books are:
+
+- `4d-ayt` (Fizik): `1_ünite_vektörler_kuvvet_dengesi_doğrula_1_q3_s10.jpg`,
+  `dene_testi_1_q5_s58.jpg`; checked against the answer key at the back.
+- `4d-ayt-biyoloji`: each topic holds two tests and each unit's "ÖSYM Tarzı
+  Testler" several, so the header's test is added:
+  `1_ünite_sinir_doku_nöron_yapısı_test_01_q4_s9.jpg`. Each page prints its
+  own answers along the bottom ("1-C 2-A …"); they are read from the text
+  layer for answers.csv and the self-check.
+- `yeniyorum`: every topic has "Pekiştir" and "Geliştir" pages and every
+  unit "Bitir" tests: `1_ünite_mevsimlerin_oluşumu_pekiştir_04_q2_s13.jpg`,
+  `1_ünite_bitir_test_02_q5_s24.jpg`. The answer key at the back (grids of
+  numbers and letters) is matched to each page by its unit and test.
+
+The contents can list entries without leader dots (a page number far
+right), across two columns, or with the dots set as unknown glyphs; page
+numbers printed beside the book's title at the outer edge place the
+entries. Captions numbered inside picture panels, numbered tables of
+options ("1. D  2. Y"), and option letters set over pictures are told
+apart from questions and options.
 
 ### answers.csv and the self-check
 

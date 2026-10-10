@@ -41,6 +41,7 @@ export interface PageData {
   plainTopic?: string; // header line that reads as a topic (profiles naming per test)
   marked?: Record<string, string>; // answers hidden in the text layer, by question number (answerMarks)
   contents?: any; // what the book's contents need from this page (bookIndex)
+  testLabel?: string; // the page's own test within its contents entry (headerTest): "test 01"
   pdf?: PdfPageRef;
   error?: string;
   /** Results from a saved session: the page is rendered again, not analyzed. */

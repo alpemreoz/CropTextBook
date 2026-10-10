@@ -32,6 +32,8 @@ export interface LocalAnalysis extends AnalysisResult {
   marked?: Record<string, string>;
   /** What the book's contents need from this page (`bookIndex`). */
   contents?: any;
+  /** The page's own test within its contents entry (`headerTest`): "test 01", "pekiştir 04". */
+  testLabel?: string;
   /** Digit shapes of the badge number, for reading it by shape (scans). */
   weekGlyphs?: { aspect: number; bits: string }[];
   fromTextLayer: boolean;
@@ -349,9 +351,12 @@ export const analyzeTestPageLocal = async (
   }
 
   // Printed answers (profiles with `answerKey`), for answers.csv and the
-  // self-check: a few OCR passes over the answer band, merged.
+  // self-check: from the text layer, or a few OCR passes over the answer
+  // band, merged.
   let answers: { n: number; letter: string }[] | undefined;
-  if (opts.answerKey) {
+  if (opts.answerKey && fromText) {
+    answers = core.answersFromText(allLines, core.answerKeyBand(W, H, opts.answerKey));
+  } else if (opts.answerKey) {
     const band = core.answerKeyBand(W, H, opts.answerKey);
     const texts: string[] = [];
     for (const pass of core.answerKeyImages(rgba, W, H, 4, band, opts.answerKey)) {
@@ -383,6 +388,10 @@ export const analyzeTestPageLocal = async (
     answers,
     marked,
     contents,
+    // (From the top of the page: the header band can end above it.)
+    testLabel: opts.headerTest
+      ? core.readTestLabel((fromText ? allLines : headerLines).filter(l => l.bbox.y1 < H * 0.12), Array.isArray(opts.headerTest) ? opts.headerTest : [])
+      : undefined,
     pageNumber: core.readPageNumber(footerLines, W) ?? 'unknown',
     testNumber: title.testNumber ?? testNumber,
     topic: section ?? headerTopic,

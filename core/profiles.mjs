@@ -53,6 +53,11 @@ export const DEFAULTS = {
   // Test number and topic printed together in the page header ("1  Metni
   // Görsellerle Yorumlama"), named per test (with namesPerTest).
   titleFromHeader: false,
+  // With bookIndex: contents entries that hold several tests, each page
+  // starting over at question 1. The page's own test from its header
+  // ("TEST-1"; or a number over one of these words, "01" / "Pekiştir") is
+  // added to the entry's name: false, true, or the words.
+  headerTest: false,
 };
 
 export const PROFILES = {
@@ -145,6 +150,27 @@ export const PROFILES = {
     titleFromHeader: true,
     namesPerTest: true,
     passageWithInstruction: true,
+  },
+  // AYT question banks (A–E options, text-layer PDFs).
+  '4d-ayt': {
+    label: '4D Serisi (NEV) – AYT Soru Bankası (Fizik)',
+    mixedColumns: true,
+    bookIndex: true,
+  },
+  '4d-ayt-biyoloji': {
+    label: '4D Serisi (NEV) – AYT Biyoloji Soru Bankası',
+    mixedColumns: true,
+    bookIndex: true,
+    headerTest: true,
+    answerKey: { band: 'bottom' },
+  },
+  // Grade-8 question bank: "Pekiştir" / "Geliştir" pages per topic, "Bitir"
+  // tests per unit.
+  yeniyorum: {
+    label: 'Yeniyorum – 8. Sınıf Fen Bilimleri Soru Bankası',
+    mixedColumns: true,
+    bookIndex: true,
+    headerTest: ['Pekiştir', 'Geliştir'],
   },
 };
 

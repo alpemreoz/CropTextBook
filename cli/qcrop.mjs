@@ -484,11 +484,19 @@ const analyzePage = async (page) => {
   // Görsellerle Yorumlama"; profiles with `titleFromHeader`).
   const title = fromText && opts.titleFromHeader ? core.readNumberedTitle(allLines.filter(l => l.bbox.y1 < H * 0.12)) : {};
   if (title.testNumber) testNumber = title.testNumber;
+  // The page's own test within its contents entry (profiles with `headerTest`),
+  // from the top of the page (the header band can end above it).
+  const testLabel = opts.headerTest
+    ? core.readTestLabel((fromText ? allLines : headerLines).filter(l => l.bbox.y1 < H * 0.12), Array.isArray(opts.headerTest) ? opts.headerTest : [])
+    : undefined;
 
   // Printed answers (profiles with `answerKey`), for answers.csv and the
-  // self-check: a few OCR passes over the answer band, merged.
+  // self-check: from the text layer, or a few OCR passes over the answer
+  // band, merged.
   let answers;
-  if (opts.answerKey) {
+  if (opts.answerKey && fromText) {
+    answers = core.answersFromText(allLines, core.answerKeyBand(W, H, opts.answerKey));
+  } else if (opts.answerKey) {
     const band = core.answerKeyBand(W, H, opts.answerKey);
     const texts = await Promise.all(core.answerKeyImages(gray, W, H, 1, band, opts.answerKey).map(async ({ width, height, data }) => {
       const png = await sharp(Buffer.from(data), { raw: { width, height, channels: 1 } }).png().toBuffer();
@@ -498,7 +506,7 @@ const analyzePage = async (page) => {
   }
 
   return {
-    regions, testNumber, pageNumber, pageLabel, ow, oh, fromText, answers, marked,
+    regions, testNumber, testLabel, pageNumber, pageLabel, ow, oh, fromText, answers, marked,
     // (for the test harness's overlays)
     cells: process.env.QCROP_DUMP ? layout.columns.map(c => ({
       x0: c.x0 / W, x1: c.x1 / W, y0: (c.y0 ?? layout.contentTop) / H, y1: (c.y1 ?? layout.contentBottom) / H,
@@ -635,15 +643,22 @@ if (opts.bookIndex) {
     const contents = core.bookContents(text.map((items, k) => {
       const W = 2000, H = Math.round(2000 * items.aspect);
       return { pdfPage: k + 1, ...core.contentsPageInfo(core.groupLines(core.wordsFromTextItems(items, W, H)), W, H) };
-    }), text.length);
+    }), text.length, { entriesHoldTests: !!opts.headerTest });
     if (!contents.tests.length) { console.log(`${path.basename(book)}: no table of contents found`); continue; }
+    if (opts.headerTest) {
+      const order = [...idxs].sort((a, b) => pages[a].pdfPage - pages[b].pdfPage);
+      const labels = core.carryTestLabels(order.map(i => ({ label: results[i].testLabel, entry: contents.testAt(pages[i].pdfPage) })));
+      order.forEach((i, k) => { results[i].testLabel = labels[k]; });
+    }
     for (const i of idxs) {
       const t = contents.tests[contents.testAt(pages[i].pdfPage)];
       if (!t) continue;
-      topics[i] = core.contentsTestName(t);
+      topics[i] = [core.contentsTestName(t), results[i].testLabel].filter(Boolean).join(' ');
       results[i].testNumber = undefined;
     }
-    const check = core.checkAgainstKey(contents, idxs.map(i => ({ pdfPage: pages[i].pdfPage, questions: results[i].regions.map(q => +q.questionNumber) })));
+    // (Entries holding several tests: each page's own test is found in the key.)
+    const crops = idxs.map(i => ({ pdfPage: pages[i].pdfPage, label: results[i].testLabel, questions: results[i].regions.map(q => +q.questionNumber) }));
+    const check = opts.headerTest ? core.checkLabelsAgainstKey(contents, crops) : core.checkAgainstKey(contents, crops);
     for (const i of idxs) for (const q of results[i].regions) {
       const letter = check.answerOf(pages[i].pdfPage, +q.questionNumber);
       if (letter) answerOf.set(`${i}:${q.questionNumber}`, letter);
@@ -651,19 +666,21 @@ if (opts.bookIndex) {
     // Only tests whose pages were all analyzed (--pages may cover part of the book).
     const analyzed = new Set(idxs.map(i => pages[i].pdfPage));
     for (const r of check.report) {
+      const start = r.test?.start ?? r.start, end = r.test?.end ?? r.end;
       let all = true;
-      for (let pg = r.test.start; pg <= r.test.end; pg++) if (!analyzed.has(pg)) all = false;
+      for (let pg = start; pg <= end; pg++) if (!analyzed.has(pg)) all = false;
       if (!all) continue;
       tests++;
       if (!r.missing.length && !r.extra.length && !r.duplicate.length) { clean++; continue; }
       missingTotal += r.missing.length; extraTotal += r.extra.length;
-      checkLines.push(`${path.basename(book)} s${r.test.start}-s${r.test.end} ${core.contentsTestName(r.test)}:` +
+      checkLines.push(`${path.basename(book)} s${start}-s${end} ${r.name ?? core.contentsTestName(r.test)}:` +
         `${r.missing.length ? ` not cropped: ${r.missing.join(',')}` : ''}` +
         `${r.extra.length ? ` | not in the answer key: ${r.extra.join(',')}` : ''}` +
         `${r.duplicate.length ? ` | cropped twice: ${r.duplicate.join(',')}` : ''}`);
     }
   }
-  console.log(`Self-check: ${clean}/${tests} tests match the answer key; ${missingTotal} question(s) not cropped, ${extraTotal} not in the key (see check.txt)`);
+  // (Books whose answers are printed on the pages instead are checked below.)
+  if (tests || !opts.answerKey) console.log(`Self-check: ${clean}/${tests} tests match the answer key; ${missingTotal} question(s) not cropped, ${extraTotal} not in the key (see check.txt)`);
 }
 // Answers hidden in the text layer fill in where no key gives one. Where
 // both exist and disagree, the printed key wins; check.txt lists them.

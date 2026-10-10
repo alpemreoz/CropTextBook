@@ -315,6 +315,22 @@ export const tidyTextWords = (words, W, map) => {
       return n >= Math.max(3, (x1 - x0) * (y1 - y0) * 0.01);
     });
   }
+  // A question number stored as two pieces ("2" and ".") is one word.
+  {
+    const dots = words.filter(w => w.text === '.');
+    if (dots.length) {
+      const drop = new Set(), joined = new Map();
+      for (const d of dots) {
+        const h = d.bbox.y1 - d.bbox.y0;
+        const p = words.find(o => /^\d{1,3}$/.test(o.text) && !joined.has(o) && Math.abs(o.bbox.y1 - d.bbox.y1) < h * 0.3 &&
+          d.bbox.x0 - o.bbox.x1 < h * 0.15 && d.bbox.x0 >= o.bbox.x1 - 2);
+        if (!p) continue;
+        drop.add(d);
+        joined.set(p, { ...p, text: `${p.text}.`, bbox: { ...p.bbox, x1: d.bbox.x1, y1: Math.max(p.bbox.y1, d.bbox.y1) } });
+      }
+      if (drop.size) words = words.filter(w => !drop.has(w)).map(w => joined.get(w) ?? w);
+    }
+  }
   const xs = labelBoxesFromWords(words).filter(b => b.x0 < W * 0.4).map(b => b.x0);
   if (xs.length) {
     const lm = Math.min(...xs);
@@ -351,29 +367,77 @@ export const mixedColumns = (map, layout, words, marks = hiddenAnswerMarks(words
   // below 90% of the page height.
   let bottom = layout.contentBottom;
   {
-    const rows = groupLines(words).sort((a, b) => b.bbox.y0 - a.bbox.y0);
-    let footerTop = null, prevTop = null;
-    for (const r of rows) {
-      if (r.bbox.y0 < H * 0.9) break;
-      // (The footer is the bottom line and any line right above it; a
-      // question's last options sit further up.)
-      if (prevTop !== null && prevTop - r.bbox.y1 > H * 0.008) break;
-      prevTop = r.bbox.y0;
+    const footerLike = (r) => {
       const t = r.text.trim();
       const letters = (t.match(/\p{L}/gu) ?? []).length, caps = (t.match(/\p{Lu}/gu) ?? []).length;
-      const footerLike = !/^[A-E]\)/.test(t) && (/(^|\s)\d{1,3}(\s|$)/.test(t) || (letters >= 4 && caps / letters >= 0.6) ||
+      return !/^[A-E]\)/.test(t) && (/(^|\s)\d{1,3}(\s|$)/.test(t) || (letters >= 4 && caps / letters >= 0.6) ||
         /(^|\s)\p{Lu}{4,}(\s|$)/u.test(t));
-      if (!footerLike) break;
-      footerTop = r.bbox.y0;
+    };
+    const rows = groupLines(words).sort((a, b) => b.bbox.y0 - a.bbox.y0);
+    let prevTop = null;
+    const footerRows = [];
+    // (A strip of the page's answers, "1-D 2-C 3-C …", is page furniture
+    // however far above the footer it sits.)
+    const answerStrip = (r) => (r.text.match(/\d{1,2}\s*-\s*[A-E](?![\p{L}])/gu) ?? []).length >= 3;
+    for (const r of rows) {
+      // (The footer is the bottom line and any line right above it; a
+      // question's last options sit further up.)
+      const ends = r.bbox.y0 < H * 0.88 || (r.bbox.y0 < H * 0.9 && !answerStrip(r)) ||
+        (prevTop !== null && prevTop - r.bbox.y1 > H * 0.008 && !answerStrip(r)) || !footerLike(r);
+      if (ends) {
+        // Lines overlapping the content line above them are part of it
+        // (the denominators of fractions in a last row of options).
+        while (footerRows.length && footerRows[footerRows.length - 1].bbox.y0 < r.bbox.y1 - 2) footerRows.pop();
+        break;
+      }
+      prevTop = r.bbox.y0;
+      footerRows.push(r);
     }
+    const footerTop = footerRows.length ? footerRows[footerRows.length - 1].bbox.y0 : null;
     if (footerTop !== null) {
       bottom = Math.min(bottom, Math.round(footerTop - H * 0.006));
       layout = { ...layout, contentBottom: bottom, footerTop: Math.min(layout.footerTop ?? footerTop, Math.round(footerTop)) };
     }
+    // Decorations running from the last options down into the footer (corner
+    // dot patterns, a per-page answer strip) hide the gap above the footer
+    // from the ink layout, which then cuts the last line off. A line the
+    // bottom cuts through, or an option line right below it, that isn't
+    // footer text belongs to the content.
+    let grown = bottom;
+    for (const r of rows.slice().reverse()) {
+      if (r.bbox.y1 <= grown + 2 || r.bbox.y0 < top) continue;
+      if (footerTop !== null && r.bbox.y1 > footerTop) break;
+      const crosses = r.bbox.y0 < grown - 2;
+      const optionBelow = /^[A-E]\)/.test(r.text.trim()) && r.bbox.y0 < grown + H * 0.03;
+      if (!(crosses || optionBelow) || footerLike(r)) break;
+      grown = Math.round(r.bbox.y1 + H * 0.002);
+    }
+    if (grown > bottom) {
+      bottom = grown;
+      layout = { ...layout, contentBottom: bottom };
+    }
   }
   const inContent = (b) => b.y0 >= top - 2 && b.y1 <= bottom + 2;
   // (A footer's "8. SINIF" is no question number.)
-  const labels = labelBoxesFromWords(words).filter(b => inContent(b) && b.y0 < H * 0.93);
+  // (Nor is a numbered entry of an options table, "1. D   1. Y": a single
+  // letter after it, then a gap or the next entry. "3. K noktasından" is a
+  // question.)
+  const after = (b) => {
+    const h = b.y1 - b.y0;
+    return words.filter(o => o.bbox.x0 >= b.x1 - 1 && o.bbox.x0 - b.x1 < h * 1.5 &&
+      o.bbox.y0 < b.y1 && o.bbox.y1 > b.y0).sort((p, q) => p.bbox.x0 - q.bbox.x0)[0];
+  };
+  const tableEntry = (b) => {
+    const next = after(b);
+    if (!next || !/^\p{L}$/u.test(next.text)) return false;
+    const then = after(next.bbox);
+    return !then || /^\d{1,3}\.$/.test(then.text);
+  };
+  // (Nor are the numbered captions of a picture panel, set smaller than the
+  // page's option letters.)
+  const optHs = words.filter(w => /^[A-E]\)$/.test(w.text)).map(w => w.bbox.y1 - w.bbox.y0).sort((a, b) => a - b);
+  const minLabelH = optHs.length >= 4 ? optHs[optHs.length >> 1] * 0.85 : 0;
+  const labels = labelBoxesFromWords(words).filter(b => inContent(b) && b.y0 < H * 0.93 && !tableEntry(b) && b.y1 - b.y0 >= minLabelH);
   // (with their numbers)
   const numOf = new Map(words.filter(w => /^\d{1,3}\.$/.test(w.text)).map(w => [w.bbox, parseInt(w.text, 10)]));
   const tol = W * 0.012;
@@ -400,8 +464,12 @@ export const mixedColumns = (map, layout, words, marks = hiddenAnswerMarks(words
     let best = null;
     for (const b of [...rs].sort((p, q) => p.x0 - q.x0)) {
       const same = rs.filter(o => Math.abs(o.x0 - b.x0) < tol);
-      const score = [same.filter(o => (numOf.get(o) ?? 0) > maxLeft).length, same.length];
-      if (!best || score[0] > best.score[0] || (score[0] === best.score[0] && score[1] > best.score[1])) best = { x: b.x0, score };
+      // (Fewer numbers that don't continue them: a numbered list inside a
+      // right-column question restarts at 1.)
+      const cont = same.filter(o => (numOf.get(o) ?? 0) > maxLeft).length;
+      const score = [cont, cont - same.length, same.length];
+      const k = best ? score.findIndex((v, i) => v !== best.score[i]) : -1;
+      if (!best || (k >= 0 && score[k] > best.score[k])) best = { x: b.x0, score };
     }
     // With numbers on the left, the right column's continue them.
     rm = best && (best.score[0] > 0 || maxLeft === 0) ? best.x : null;
@@ -485,8 +553,25 @@ export const mixedColumns = (map, layout, words, marks = hiddenAnswerMarks(words
     const ls = line.words.map(w => ({ m: /^\(?([A-E])\)/.exec(w.text), x: w.bbox.x0 })).filter(o => o.m);
     if (ls.length < 2) return false;
     const letters = ls.map(o => o.m[1]), xs = ls.map(o => o.x);
-    return Math.min(...xs) < half - W * 0.05 && Math.max(...xs) - Math.min(...xs) > W * 0.3 &&
+    // (Reaching the right half: three options across a wide left column
+    // don't.)
+    return Math.min(...xs) < half - W * 0.05 && Math.max(...xs) - Math.min(...xs) > W * 0.3 && Math.max(...xs) > half - W * 0.06 &&
       letters.every((l, i) => !i || l.charCodeAt(0) === letters[i - 1].charCodeAt(0) + 1);
+  };
+  // (Unless the right half's letters continue options running down the
+  // right half just above: a right-column question's, printed beside the
+  // left one's.)
+  const rightContinues = (line) => {
+    const first = line.words.find(w => w.bbox.x0 >= half && /^\(?[A-E]\)/.test(w.text));
+    const c = first && /^\(?([A-E])\)/.exec(first.text)[1];
+    if (!c || c === 'A') return false;
+    const prev = new RegExp(`^\\(?${String.fromCharCode(c.charCodeAt(0) - 1)}\\)`);
+    // (Two letters before them on the line: one run, "A) B) | C) D)".)
+    if (line.words.filter(w => w.bbox.x0 < first.bbox.x0 && /^\(?[A-E]\)/.test(w.text)).length >= 2) return false;
+    // (Set straight above it: a list of options running down the right
+    // column, not another question's "A) | B)" grid.)
+    return words.some(w => Math.abs(w.bbox.x0 - first.bbox.x0) < W * 0.02 && w.bbox.y1 <= line.bbox.y0 + 2 &&
+      w.bbox.y0 > line.bbox.y0 - H * 0.15 && prev.test(w.text));
   };
   // Where a full-width question's ink ends: the first blank stretch after
   // its options (the gutter strip, where a vertical logo can sit, aside).
@@ -564,7 +649,7 @@ export const mixedColumns = (map, layout, words, marks = hiddenAnswerMarks(words
     const sideBySide = rightBlock && !right.some(R => R.y0 < rightBlock.top &&
       (R.y0 > prevLeft || !full.some(r => r.y0 > R.y0 && r.y0 < L.y0))) &&
       !findOptionBlock(leftOwn, L.y0, rightBelow);
-    if (!sideBySide && !own.some(l => l.bbox.y0 < rightBelow && (crossing(l) || (!halfOptions && spread(l)))) &&
+    if (!sideBySide && !own.some(l => l.bbox.y0 < rightBelow && (crossing(l) || (!halfOptions && spread(l) && !rightContinues(l)))) &&
       !pictureRow(L, rightBelow) && !(right.length === 0 || !leftBlock ? pictureAcross(L.y0, Math.min(rightBelow, next)) : false)) return;
     const block = findOptionBlock(own, L.y0, next);
     const end = Math.min(rightBelow - pad, block ? Math.min(next - pad, endAfter(block.bottom, next)) : next - pad);
@@ -869,7 +954,10 @@ export const groupLines = (words) => {
     for (const w of l.words.sort((a, b) => a.bbox.x0 - b.bbox.x0)) {
       const prev = ws[ws.length - 1];
       const h = Math.max(w.bbox.y1 - w.bbox.y0, prev ? prev.bbox.y1 - prev.bbox.y0 : 0);
-      if (prev && w.bbox.x0 - prev.bbox.x1 < h * 0.12) {
+      // (Not an option letter drawn over a picture's label: "B)" on "cam"
+      // are two words that overlap, not pieces of one.)
+      const overlapsLetter = prev && w.bbox.x0 < prev.bbox.x1 - 1 && (/^[A-E]\)/.test(w.text) || /^[A-E]\)$/.test(prev.text));
+      if (prev && w.bbox.x0 - prev.bbox.x1 < h * 0.12 && !overlapsLetter) {
         ws[ws.length - 1] = {
           text: prev.text + w.text,
           conf: Math.min(prev.conf, w.conf),
@@ -1490,6 +1578,11 @@ export const findQuestions = (params) => {
       (Math.abs(a.y0 - b.y0) < H * 0.01 ? a.col - b.col : a.y0 - b.y0));
     const alt = inSequence(rows);
     if (alt.length > sequence.length) sequence = alt;
+    // Or down the left column and the full-width bands first, then the
+    // right column (1 left, 2 full width below, 3 right beside 1).
+    const right = (t) => layout.columns[t.col].x0 > W * 0.4;
+    const down = inSequence([...tests].sort((a, b) => right(a) - right(b) || band(a) - band(b) || a.y0 - b.y0));
+    if (down.length > sequence.length) sequence = down;
   }
   for (const q of sequence) {
     const col = layout.columns[q.col];
@@ -1787,6 +1880,20 @@ export const readPageNumber = (footerLines, W) => {
   return pageNumber;
 };
 
+/**
+ * A page number set at the outer edge beside the book's title ("Biyoloji
+ * Soru Bankası 25", "160 Biyoloji Soru Bankası"): the number that starts or
+ * ends the one footer line with words in it (text layers).
+ */
+const sidePageNumber = (footerLines) => {
+  const found = footerLines.flatMap(l => {
+    const ws = l.text.trim().split(/\s+/);
+    if (ws.filter(t => /^\p{L}{3,}$/u.test(t)).length < 2) return [];
+    return [ws[0], ws[ws.length - 1]].filter(t => /^\d{1,3}$/.test(t));
+  });
+  return found.length === 1 ? found[0] : undefined;
+};
+
 /** "TEST 04" written out in the header text, if present. */
 export const readTestNumber = (headerLines) => {
   for (const line of headerLines) {
@@ -1794,6 +1901,21 @@ export const readTestNumber = (headerLines) => {
     if (m) return m[1].padStart(2, '0');
   }
   return undefined;
+};
+
+/**
+ * The page's own test, for books whose contents entries hold several
+ * (profiles with `headerTest`): "TEST-1" -> "test 01"; a number heading the
+ * page with one of the profile's words under it ("01" / "Pekiştir") ->
+ * "pekiştir 01".
+ */
+export const readTestLabel = (headerLines, testWords = []) => {
+  const n = readTestNumber(headerLines);
+  if (n) return `test ${n}`;
+  const firsts = headerLines.map(l => l.text.trim().split(/\s+/)[0] ?? '');
+  const num = firsts.find(t => /^\d{1,2}$/.test(t));
+  const word = firsts.find(t => testWords.some(w => lowerTr(w) === lowerTr(t)));
+  return num && word ? `${word.toLocaleLowerCase('tr')} ${num.padStart(2, '0')}` : undefined;
 };
 
 const BADGE_LOOKALIKE = {
@@ -2069,6 +2191,10 @@ export const resolveWeeks = (pages) => {
 export const answerKeyBand = (W, H, spec) => (spec?.band === 'top'
   ? { x0: 0, y0: Math.round(H * 0.02), x1: W, y1: Math.round(H * 0.14) }
   : { x0: 0, y0: Math.round(H * 0.88), x1: W, y1: H });
+
+/** Printed answers from a text layer: the lines inside the answer band. */
+export const answersFromText = (lines, band) => parseAnswerKey([lines
+  .filter(l => l.bbox.y0 >= band.y0 && l.bbox.y1 <= band.y1).map(l => l.text).join('\n')]);
 
 /**
  * Images of the answer band for OCR, one per pass: long horizontal and
@@ -2446,10 +2572,12 @@ export const imageSequence = (name) => {
 // ---------------------------------------------------------------------------
 
 // "Doğrula - 1 : . ......... 10", "n Düşün - 2 (Olasılık) ...... 118"
-const TOC_ENTRY_RE = /^(.*?)[\s.:…]*\.{4,}[\s.:…]*(\d{1,3})$/;
+// (Leader dots can come out as unknown glyphs, "���".)
+const TOC_ENTRY_RE = /^(.*?)[\s.:…\uFFFD]*[.\uFFFD]{4,}[\s.:…\uFFFD]*(\d{1,3})$/u;
 // "ÜNİTE 1 : ÇARPANLAR VE KATLAR" (contents), "1. ÜNİTE: ..." (answer key),
-// "UNIT 5: THE INTERNET". Matched on Turkish-lowercased text.
-const UNIT_RE = /^(?:(\d{1,2})\s*\.\s*)?(ünite|unit)\s*(\d{1,2})?\s*:\s*(.*)$/u;
+// "UNIT 5: THE INTERNET", "Ünite - 1 Sinir Sistemi", "1. ÜNİTE / BASINÇ".
+// Matched on Turkish-lowercased text.
+const UNIT_RE = /^(?:(\d{1,2})\s*\.\s*)?(ünite|unit)\s*(?:[-–]\s*)?(\d{1,2})?\s*(?:[-–:/]\s*|\s(?=\D)|$)(.*)$/u;
 // For matching only: Turkish lowercase, with dotless ı folded (English text
 // lowercased the Turkish way turns "UNIT" into "unıt").
 const KEY_ANSWER_RE = /(\d{1,3})\s*-\s*([A-E])(?!\p{L})/gu;
@@ -2464,13 +2592,52 @@ const lowerTr = (s) => s.toLocaleLowerCase('tr').replace(/ı/g, 'i');
  * x is the line's left edge as a fraction of the page width.
  */
 export const readContentsPage = (lines, W) => {
-  const sorted = [...lines].sort((a, b) => a.bbox.y0 - b.bbox.y0);
+  // Rows are cut where a wide gap separates columns, and the columns are
+  // read one after another (two-column contents pages). A page number set
+  // far right of its name (no leader dots) joins it.
+  const pieces = [];
+  for (const l of lines) {
+    const runs = [];
+    for (const w of [...(l.words ?? [])].sort((a, b) => a.bbox.x0 - b.bbox.x0)) {
+      const r = runs[runs.length - 1];
+      // (An entry ends at its page number after the leader dots, even when
+      // the dots run up to the next column.)
+      const ended = r && r.length >= 2 && /^\d{1,3}$/.test(r[r.length - 1].text) && /[.\uFFFD…]{3,}$/u.test(r[r.length - 2].text);
+      if (r && !ended && w.bbox.x0 - r[r.length - 1].bbox.x1 <= W * 0.04) r.push(w); else runs.push([w]);
+    }
+    if (!runs.length) { pieces.push({ ...l, col: 0 }); continue; }
+    const joined = [];
+    for (const r of runs) {
+      const prev = joined[joined.length - 1];
+      if (prev && r.length === 1 && /^\d{1,3}$/.test(r[0].text)) { prev.words.push({ ...r[0], text: `.... ${r[0].text}` }); continue; }
+      joined.push({ words: [...r] });
+    }
+    for (const j of joined) {
+      const g = groupLines(j.words)[0];
+      pieces.push({ ...g, col: g.bbox.x0 >= W * 0.45 ? 1 : 0 });
+    }
+  }
+  // (A page number alone on its row, right of the middle, isn't a column.)
+  const worded = pieces.filter(p => /\p{L}/u.test(p.text));
+  const twoCols = worded.some(p => p.col === 1) && worded.some(p => p.col === 0);
+  const sorted = pieces.sort((a, b) => (twoCols ? a.col - b.col : 0) || a.bbox.y0 - b.bbox.y0);
   const clean = (l) => l.text.replace(/\s+/g, ' ').trim();
-  if (sorted.filter(l => TOC_ENTRY_RE.test(clean(l))).length < 4) return null;
+  // (Entries without leader dots only on a page titled as contents: any
+  // page has lines ending in a number far right.)
+  const leadered = lines.filter(l => TOC_ENTRY_RE.test(clean(l))).length;
+  const titled = lines.some(l => /^(içindekiler|contents)$/.test(lowerTr(clean(l))));
+  // (Or on a page that is mostly entries and unit headings: a contents
+  // page continued without its title.)
+  const entries = sorted.filter(l => TOC_ENTRY_RE.test(clean(l))).length;
+  const units = sorted.filter(l => { const u = UNIT_RE.exec(lowerTr(clean(l))); return u && (u[1] || u[3]); }).length;
+  const mostly = units > 0 && entries + units >= sorted.filter(l => /\p{L}/u.test(l.text)).length * 0.8;
+  if (leadered < 4 && !((titled || mostly) && entries >= 4)) return null;
   const items = [];
-  let pending = null;
+  let pending = null, lastText = null;
   for (const l of sorted) {
     const text = clean(l), x = l.bbox.x0 / W;
+    const unmatched = lastText;
+    lastText = null;
     const u = UNIT_RE.exec(lowerTr(text));
     if (u && (u[1] || u[3]) && !TOC_ENTRY_RE.test(text)) {
       items.push({ kind: 'unit', unit: +(u[1] ?? u[3]), word: u[2], x });
@@ -2488,6 +2655,11 @@ export const readContentsPage = (lines, W) => {
       if (pm) { name = pm[1].trim(); paren = pm[2].replace(/\s*-\s*$/, '').trim(); }
       items.push({ kind: 'test', name, paren, page: +m[2], bullet: /^n\s/.test(full), x: pending ? pending.x : x });
       pending = null;
+    } else if (/^(?:\.{4} )?\d{1,3}$/.test(text) && unmatched) {
+      // An entry whose name wraps around its page number ("Basıncın Günlük
+      // Yaşam ve Teknolojideki" / "83" / "Uygulamaları").
+      items.push({ kind: 'test', name: unmatched.text, page: +text.replace(/\D/g, ''), bullet: false, x: unmatched.x });
+      pending = null;
     } else if (/\([^)]*$/.test(full)) {
       pending = { text: full, x: pending ? pending.x : x };
     } else if (/^n\s+\S/.test(text)) {
@@ -2498,6 +2670,7 @@ export const readContentsPage = (lines, W) => {
       // Doğruluğu ve" / "Güvenilirliği").
       const prev = items[items.length - 1];
       if (prev?.kind === 'topic' && !prev.wrapped) { prev.text = `${prev.text} ${text}`.replace(/\s+-\s+(?=\S)/, ' - '); prev.wrapped = true; }
+      else lastText = { text, x };
       pending = null;
     }
   }
@@ -2510,12 +2683,15 @@ export const readContentsPage = (lines, W) => {
  * { kind: 'test', name, answers: Map(n -> letter) } rows ("Doğrula Testi - 1
  * 1-D 2-C ..."; a row of answers alone continues the test above).
  */
-export const readAnswerKeyPage = (lines) => {
+export const readAnswerKeyPage = (lines, W) => {
   const sorted = [...lines].sort((a, b) => a.bbox.y0 - b.bbox.y0 || a.bbox.x0 - b.bbox.x0);
   // The title may be set in pieces ("CEVAP" / "ANAHTARI" on lines of their own).
   const raw = sorted.map(l => l.text).join(' '), all = lowerTr(raw);
   const titled = /cevap|answer/.test(all) && /anahtar|key/.test(all);
-  if (!titled && (raw.match(KEY_ANSWER_RE) ?? []).length < 30) return null;
+  const pairs = (raw.match(KEY_ANSWER_RE) ?? []).length;
+  if (!titled && pairs < 30) return null;
+  // (Answers set as grids of numbers and letters instead of "1-D 2-C".)
+  if (pairs < 5 && W) return readAnswerGrid(lines, W);
   const items = [];
   let cur = null;
   for (const l of sorted) {
@@ -2534,6 +2710,50 @@ export const readAnswerKeyPage = (lines) => {
   return items.filter(it => it.kind === 'unit' || it.answers.size);
 };
 
+/**
+ * An answer key set as grids (Yeniyorum): a test's name ("Pekiştir 1"),
+ * the question numbers in a row beside it, a little higher, and the letters
+ * in a row under them; two columns of these, read one after the other.
+ * -> items as readAnswerKeyPage's, or null when there are none.
+ */
+const readAnswerGrid = (lines, W) => {
+  const words = lines.flatMap(l => l.words ?? []);
+  const items = [];
+  // (Unit headings of both columns can share a row: rows are cut at wide gaps.)
+  for (const l of lines) {
+    const runs = [];
+    for (const w of [...(l.words ?? [])].sort((a, b) => a.bbox.x0 - b.bbox.x0)) {
+      const r = runs[runs.length - 1];
+      if (r && w.bbox.x0 - r[r.length - 1].bbox.x1 <= W * 0.04) r.push(w); else runs.push([w]);
+    }
+    for (const r of runs) {
+      const u = UNIT_RE.exec(lowerTr(r.map(w => w.text).join(' ')));
+      if (u && (u[1] || u[3])) items.push({ kind: 'unit', unit: +(u[1] ?? u[3]), x: r[0].bbox.x0, y: r[0].bbox.y0 });
+    }
+  }
+  for (const L of words) {
+    if (!/^\p{L}{3,}$/u.test(L.text)) continue;
+    const h = L.bbox.y1 - L.bbox.y0;
+    const N = words.find(w => /^\d{1,2}$/.test(w.text) && w.bbox.x0 > L.bbox.x1 && w.bbox.x0 - L.bbox.x1 < h * 1.2 &&
+      Math.abs(w.bbox.y0 - L.bbox.y0) < h * 0.3);
+    if (!N) continue;
+    const xa = N.bbox.x1 + h, xb = N.bbox.x1 + W * 0.35;
+    const inRow = (w, ya, yb) => w.bbox.x0 > xa && w.bbox.x0 < xb && (w.bbox.y0 + w.bbox.y1) / 2 > ya && (w.bbox.y0 + w.bbox.y1) / 2 < yb;
+    const nums = words.filter(w => /^\d{1,2}$/.test(w.text) && inRow(w, L.bbox.y0 - h * 1.2, L.bbox.y0 + h * 0.3));
+    if (nums.length < 4) continue;
+    const answers = new Map();
+    for (const a of words.filter(w => /^[A-E]$/.test(w.text) && inRow(w, L.bbox.y0 + h * 0.2, L.bbox.y1 + h * 1.2))) {
+      const cx = (a.bbox.x0 + a.bbox.x1) / 2;
+      const n = nums.reduce((best, w) => Math.abs((w.bbox.x0 + w.bbox.x1) / 2 - cx) < Math.abs((best.bbox.x0 + best.bbox.x1) / 2 - cx) ? w : best);
+      if (Math.abs((n.bbox.x0 + n.bbox.x1) / 2 - cx) < h) answers.set(+n.text, a.text);
+    }
+    if (answers.size) items.push({ kind: 'test', name: `${L.text} ${N.text}`, answers, x: L.bbox.x0, y: L.bbox.y0 });
+  }
+  if (!items.some(it => it.kind === 'test')) return null;
+  const col = (it) => (it.x < W * 0.45 ? 0 : 1);
+  return items.sort((a, b) => col(a) - col(b) || a.y - b.y).map(({ x, y, ...it }) => it);
+};
+
 /** "Doğrula Testi - 1" and "Doğrula - 1" -> "doğrula1". */
 const testKey = (name) => lowerTr(name).replace(/testi?/g, '').replace(/[^\p{L}\p{N}]/gu, '');
 
@@ -2544,8 +2764,9 @@ const testKey = (name) => lowerTr(name).replace(/testi?/g, '').replace(/[^\p{L}\
  */
 export const contentsPageInfo = (lines, W, H) => ({
   toc: readContentsPage(lines, W),
-  key: readAnswerKeyPage(lines),
-  printed: readPageNumber(lines.filter(l => l.bbox.y0 > H * 0.92), W),
+  key: readAnswerKeyPage(lines, W),
+  printed: readPageNumber(lines.filter(l => l.bbox.y0 > H * 0.92), W) ?? sidePageNumber(lines.filter(l => l.bbox.y0 > H * 0.92)),
+  head: lines.filter(l => l.bbox.y1 < H * 0.12).map(l => l.text).join(' ').slice(0, 300),
   startsTest: lines.some(l => /^1\.(\s|$)/.test(l.text.trim()) && l.bbox.x0 < W * 0.6),
 });
 
@@ -2557,7 +2778,8 @@ export const contentsPageInfo = (lines, W, H) => ({
  * -> { tests: [{ label, unit, unitWord, topic, start, end, answers? }],
  *      testAt(pdfPage) -> index | -1, keyPages: [pdfPage] }
  */
-export const bookContents = (pages, pageCount = pages.length) => {
+export const bookContents = (pages, pageCount = pages.length, { entriesHoldTests = false } = {}) => {
+  const align = !entriesHoldTests;
   const toc = [], key = [], keyPages = [], offsets = [];
   const n = pageCount;
   pages = [...pages].sort((a, b) => a.pdfPage - b.pdfPage);
@@ -2572,8 +2794,13 @@ export const bookContents = (pages, pageCount = pages.length) => {
   const listed = toc.filter(it => it.kind === 'test').map(it => it.page);
   const fits = (k) => listed.filter(pg => startsTest.has(pg + k)).length;
   let offset = +(majority(offsets) ?? 0);
-  for (let k = -4; k <= 4; k++) if (fits(k) > fits(offset)) offset = k;
+  // (Not when the entries hold several tests, each starting over at
+  // question 1: the footers decide.)
+  if (align) for (let k = -4; k <= 4; k++) if (fits(k) > fits(offset)) offset = k;
 
+  // (Only in contents that indent their entries under the unit headings.)
+  let nested = false;
+  { let u = null; for (const it of toc) { if (it.kind === 'unit') u = it; else if (it.kind === 'test' && u && it.x > u.x + 0.01) nested = true; } }
   const tests = [];
   let unit = null, topic;
   for (const it of toc) {
@@ -2582,7 +2809,7 @@ export const bookContents = (pages, pageCount = pages.length) => {
     if (/cevap|anahtar|answer key/.test(lowerTr(it.name))) continue;
     // Tests set at the unit heading's margin, or for a range of units
     // ("DENE TESTİ - 1 (1 - 3. Üniteler)"), stand on their own.
-    const own = (unit && !it.bullet && it.x <= unit.x + 0.01) || /ünite|unit/.test(lowerTr(it.paren ?? ''));
+    const own = (nested && unit && !it.bullet && it.x <= unit.x + 0.01) || /ünite|unit/.test(lowerTr(it.paren ?? ''));
     tests.push({
       label: it.name,
       unit: own ? undefined : unit?.unit,
@@ -2609,9 +2836,26 @@ export const bookContents = (pages, pageCount = pages.length) => {
       if (d <= 3 && cost[i - 1][j - 1] + d < cost[i][j]) { cost[i][j] = cost[i - 1][j - 1] + d; back[i][j] = 3; }
     }
   }
-  for (let i = E.length, j = S.length; i > 0 || j > 0;) {
+  for (let i = E.length, j = S.length; align && (i > 0 || j > 0);) {
     const b = back[i][j];
     if (b === 3) { tests[i - 1].start = S[j - 1]; i--; j--; } else if (b === 1) i--; else j--;
+  }
+  // Entries holding several tests: an entry starts on the page whose header
+  // first names it, near where it's listed (contents can be a page or two
+  // off; "DNA ve Genetik Kod 35" starting on 33).
+  if (entriesHoldTests) {
+    const norm = (t) => lowerTr(t ?? '').replace(/[^\p{L}\p{N}]/gu, '');
+    const heads = new Map(pages.map(p => [p.pdfPage, norm(p.head)]));
+    for (const t of tests) {
+      const k = norm(t.label);
+      if (k.length < 4) continue;
+      let best = null;
+      for (let pg = t.start - 4; pg <= t.start + 4; pg++) {
+        if (!(heads.get(pg) ?? '').includes(k) || (heads.get(pg - 1) ?? '').includes(k)) continue;
+        if (best === null || Math.abs(pg - t.start) < Math.abs(best - t.start)) best = pg;
+      }
+      if (best !== null) t.start = best;
+    }
   }
   // (Nothing past the answer key is a test.)
   for (let i = tests.length - 1; i >= 0; i--) if (tests[i].start >= firstKey) tests.splice(i, 1);
@@ -2622,9 +2866,11 @@ export const bookContents = (pages, pageCount = pages.length) => {
   // Answer-key rows join their contents entry: same name, same unit when
   // there's a choice (every unit has a "Doğrula - 1").
   let keyUnit;
-  const used = new Set(), unmatched = [];
+  const used = new Set(), unmatched = [], keyRows = [];
   for (const it of key) {
     if (it.kind === 'unit') { keyUnit = it.unit; continue; }
+    keyRows.push({ ...it, unit: keyUnit });
+    if (entriesHoldTests) continue;
     const k = testKey(it.name);
     const cands = tests.filter(t => !used.has(t) && testKey(t.label) === k);
     const t = cands.find(t => t.unit === keyUnit) ?? cands.find(t => t.unit === undefined);
@@ -2639,7 +2885,57 @@ export const bookContents = (pages, pageCount = pages.length) => {
     if (rows.length === open.length) open.forEach((t, i) => { t.answers = rows[i].answers; });
   }
   const testAt = (pdfPage) => tests.findIndex(t => pdfPage >= t.start && pdfPage <= t.end);
-  return { tests, testAt, keyPages };
+  return { tests, testAt, keyPages, keyRows };
+};
+
+/**
+ * Test labels per page (`headerTest`), pages in book order: [{ label,
+ * entry }] -> labels. A page without one (a test's second page, its header
+ * printing only the topic) takes the label before it in the same entry.
+ */
+export const carryTestLabels = (pages) => {
+  let last, entry;
+  return pages.map(p => {
+    if (p.entry !== entry) { last = undefined; entry = p.entry; }
+    if (p.label) last = p.label;
+    return p.label ?? last;
+  });
+};
+
+/** "Pekiştir 4", "pekiştir 04", "Bitir test 01", "BİTİR 1" -> "pekiştir4", "bitir1". */
+const labelKey = (name) => testKey(name).replace(/\d+/g, d => String(+d));
+
+/**
+ * Books whose contents entries hold several tests (`headerTest`): each
+ * page's own test ("pekiştir 04"; "test 02" under a "Bitir" entry) is
+ * looked up in the answer key within its unit. pages: [{ pdfPage, label,
+ * questions: [n] }] -> { report: [{ name, start, end, missing, extra,
+ * duplicate }], answerOf(pdfPage, n) }, as checkAgainstKey.
+ */
+export const checkLabelsAgainstKey = (contents, pages) => {
+  const groups = new Map();
+  for (const p of pages) {
+    const t = contents.tests[contents.testAt(p.pdfPage)];
+    if (!t || !p.label) continue;
+    const names = [labelKey(p.label), labelKey(`${t.label} ${p.label}`)];
+    const row = contents.keyRows.find(r => r.unit === t.unit && names.includes(labelKey(r.name)));
+    if (!row) continue;
+    if (!groups.has(row)) groups.set(row, { t, pages: [], have: [] });
+    const g = groups.get(row);
+    g.pages.push(p.pdfPage);
+    g.have.push(...p.questions);
+  }
+  const byPage = new Map();
+  const report = [...groups].map(([row, g]) => {
+    for (const pg of g.pages) byPage.set(pg, row);
+    return {
+      name: `${contentsTestName(g.t)} ${row.name}`, start: Math.min(...g.pages), end: Math.max(...g.pages),
+      missing: [...row.answers.keys()].filter(n => !g.have.includes(n)),
+      extra: [...new Set(g.have.filter(n => !row.answers.has(n)))],
+      duplicate: [...new Set(g.have.filter((n, k) => g.have.indexOf(n) !== k))],
+    };
+  });
+  return { report, answerOf: (pdfPage, n) => byPage.get(pdfPage)?.answers.get(n) };
 };
 
 /** Name of a contents test for crop files: "1 ünite Çarpanlar ve Katlar Doğrula - 1". */
