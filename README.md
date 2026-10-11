@@ -341,7 +341,9 @@ table of contents, as `4d` books are:
   Testler" several, so the header's test is added:
   `1_ünite_sinir_doku_nöron_yapısı_test_01_q4_s9.jpg`. Each page prints its
   own answers along the bottom ("1-C 2-A …"); they are read from the text
-  layer for answers.csv and the self-check.
+  layer for answers.csv and the self-check. The thin rule down the gutter,
+  the line above the footer and the answer strip's frame are kept out of
+  the crops: a column's last question doesn't run into them.
 - `yeniyorum`: every topic has "Pekiştir" and "Geliştir" pages and every
   unit "Bitir" tests: `1_ünite_mevsimlerin_oluşumu_pekiştir_04_q2_s13.jpg`,
   `1_ünite_bitir_test_02_q5_s24.jpg`. The answer key at the back (grids of

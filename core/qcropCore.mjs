@@ -403,6 +403,17 @@ export const mixedColumns = (map, layout, words, marks = hiddenAnswerMarks(words
     // from the ink layout, which then cuts the last line off. A line the
     // bottom cuts through, or an option line right below it, that isn't
     // footer text belongs to the content.
+    // (Never into an answer strip's own ink: its frame can sit a few pixels
+    // under the last line. Its top is the first blank row above the strip's
+    // text, the gutter aside.)
+    let footInk = Infinity;
+    if (footerTop !== null && footerRows.some(answerStrip)) {
+      const g = (c0.x1 + c1.x0) / 2;
+      const inked = (yy) => { for (let x = c0.x0, row = yy * W; x <= c1.x1; x++) if (Math.abs(x - g) > W * 0.02 && map.ink[row + x]) return true; return false; };
+      let yy = Math.round(footerTop) - 1;
+      while (yy > footerTop - H * 0.02 && inked(yy)) yy--;
+      if (yy > footerTop - H * 0.02) footInk = yy;
+    }
     let grown = bottom;
     for (const r of rows.slice().reverse()) {
       if (r.bbox.y1 <= grown + 2 || r.bbox.y0 < top) continue;
@@ -410,11 +421,35 @@ export const mixedColumns = (map, layout, words, marks = hiddenAnswerMarks(words
       const crosses = r.bbox.y0 < grown - 2;
       const optionBelow = /^[A-E]\)/.test(r.text.trim()) && r.bbox.y0 < grown + H * 0.03;
       if (!(crosses || optionBelow) || footerLike(r)) break;
-      grown = Math.round(r.bbox.y1 + H * 0.002);
+      grown = Math.min(Math.round(r.bbox.y1 + H * 0.002), footInk);
     }
     if (grown > bottom) {
       bottom = grown;
       layout = { ...layout, contentBottom: bottom };
+    }
+    // A thin rule across the page just above the footer, below the last line
+    // of text, ends the content: crops don't run down to it. (Thin: blank
+    // rows close above and below it; a row of pictures is no rule. One
+    // unbroken line, standing free: the bottom edges of framed pictures or
+    // tables side by side aren't one, nor is a table's bottom border, its
+    // sides rising from its ends.)
+    const freeRule = (yy) => {
+      let best = 0, start = 0, run = 0;
+      for (let x = 0, row = yy * W; x < W; x++) { if (map.ink[row + x]) { if (++run > best) { best = run; start = x - run + 1; } } else run = 0; }
+      if (best < W * 0.5) return false;
+      for (const x0 of [start, start + best - 4]) {
+        for (let y = yy - 8; y <= yy - 2; y++) for (let x = x0; x < x0 + 4; x++) if (map.ink[y * W + x]) return false;
+      }
+      return true;
+    };
+    if (footerTop !== null) {
+      const lastText = Math.max(top, ...rows.filter(r => r.bbox.y1 <= bottom + 2 && r.bbox.y0 >= top).map(r => r.bbox.y1));
+      for (let yy = Math.max(Math.ceil(lastText) + 2, Math.round(footerTop - H * 0.03)); yy < bottom; yy++) {
+        if (map.rowInk[yy] < W * 0.5 || map.rowInk[yy - 3] > W * 0.05 || map.rowInk[yy + 3] > W * 0.05 || !freeRule(yy)) continue;
+        bottom = yy - 2;
+        layout = { ...layout, contentBottom: bottom };
+        break;
+      }
     }
   }
   const inContent = (b) => b.y0 >= top - 2 && b.y1 <= bottom + 2;
@@ -692,30 +727,55 @@ export const mixedColumns = (map, layout, words, marks = hiddenAnswerMarks(words
   // header band and a band above the footer span every column.)
   const scanFrom = Math.round(Math.max(top, Math.min(...[...left, ...right].map(b => b.y0), bottom) - pad));
   const scanTo = Math.min(bottom, Math.max(scanFrom, ...words.filter(w => w.bbox.y1 < bottom).map(w => Math.ceil(w.bbox.y1))));
+  const textWords = words.filter(w => /\p{L}{2,}/u.test(w.text) && (w.bbox.x1 - w.bbox.x0) > (w.bbox.y1 - w.bbox.y0) * 1.2);
   const logoColumns = (ya, yb, marginsOnly = false) => {
     // (Margins: a little past the band, a logo can stand across its edge.)
     const ext = marginsOnly ? H * 0.06 : 0;
     const from = Math.max(marginsOnly ? top : scanFrom, Math.round(ya - ext)), to = Math.min(scanTo, Math.round(yb + ext));
     const out = [];
     if (to - from < H * 0.05) return out;
-    const colTop = new Int32Array(W).fill(-1), colBot = new Int32Array(W).fill(-1);
+    const colTop = new Int32Array(W).fill(-1), colBot = new Int32Array(W).fill(-1), colN = new Int32Array(W);
     for (let y = from; y < to; y++) {
       for (let x = 0, row = y * W; x < W; x++) {
         if (!map.ink[row + x]) continue;
         if (colTop[x] < 0) colTop[x] = y;
         colBot[x] = y;
+        colN[x]++;
       }
     }
     // A divider line (a long column whose neighbours a few px away are not
     // long, solid or dotted) counts as empty: the logo can stand on it.
     const long = (x) => x >= 0 && x < W && colTop[x] >= 0 && colBot[x] - colTop[x] > (to - from) * 0.5;
-    // (A line: up to 6 neighbouring long columns.)
-    const rule = [];
+    // (A line, not text: one of its columns inked along a good part of its
+    // length, mostly outside words. Letters of lines one above the other,
+    // or a letter under a picture, aren't one.)
+    const bandWords = textWords.filter(t => t.bbox.y1 > from && t.bbox.y0 < to);
+    const inWords = (x) => {
+      let n = 0;
+      for (const t of bandWords) {
+        if (x < t.bbox.x0 || x > t.bbox.x1) continue;
+        for (let y = Math.max(from, Math.floor(t.bbox.y0)); y < Math.min(to, Math.ceil(t.bbox.y1)); y++) n += map.ink[y * W + x];
+      }
+      return n;
+    };
+    const lineLike = (k) => colN[k] >= (colBot[k] - colTop[k]) * 0.25 && inWords(k) < colN[k] * 0.5;
+    // (Up to 6 neighbouring long columns. A solid line, inked along nearly
+    // all its length, takes the faint columns of its anti-aliased edges with
+    // it, and a logo standing on it is one piece across it.)
+    const rule = [], solid = new Set();
     for (let x = 0; x < W; x++) {
       if (!long(x) || long(x - 1)) continue;
       let x1 = x;
       while (long(x1 + 1)) x1++;
-      if (x1 - x < 6) for (let k = x; k <= x1; k++) rule.push(k);
+      if (x1 - x >= 6) continue;
+      let line = false, isSolid = false;
+      for (let k = x; k <= x1; k++) {
+        if (lineLike(k)) line = true;
+        if (colN[k] >= (colBot[k] - colTop[k]) * 0.9) isSolid = true;
+      }
+      if (!line) continue;
+      const pad = isSolid ? 2 : 0;
+      for (let k = Math.max(0, x - pad); k <= Math.min(W - 1, x1 + pad); k++) { rule.push(k); if (isSolid) solid.add(k); }
     }
     for (const x of rule) colTop[x] = -1;
     const zone = (x) => marginsOnly ? inMargin(x) : inZone(x);
@@ -727,7 +787,9 @@ export const mixedColumns = (map, layout, words, marks = hiddenAnswerMarks(words
     for (let x = 0; x < W; x++) {
       if (colTop[x] < 0) continue;
       const r = runs[runs.length - 1];
-      if (r && x - r.x1 <= 3) r.x1 = x; else runs.push({ x0: x, x1: x });
+      let bridged = r && x - r.x1 <= 3;
+      if (r && !bridged) { bridged = true; for (let k = r.x1 + 1; k < x; k++) if (!solid.has(k)) { bridged = false; break; } }
+      if (bridged) r.x1 = x; else runs.push({ x0: x, x1: x });
     }
     runs.forEach((r, i) => {
       const w = r.x1 - r.x0 + 1;
@@ -735,7 +797,11 @@ export const mixedColumns = (map, layout, words, marks = hiddenAnswerMarks(words
       for (let k = r.x0; k <= r.x1; k++) if (colTop[k] >= 0) { y0 = Math.min(y0, colTop[k]); y1 = Math.max(y1, colBot[k]); }
       const h = y1 - y0 + 1;
       const isolated = (!runs[i - 1] || r.x0 - runs[i - 1].x1 > blankGap) && (!runs[i + 1] || runs[i + 1].x0 - r.x1 > blankGap);
-      if (w <= W * 0.02 && h <= H * 0.15 && h >= w * 3 && isolated && zone(r.x0) && zone(r.x1)) {
+      // (Letters of a word set in the text, "oluşturul-" reaching into the
+      // margin, are no logo: a word wider than tall covers them. A logo's
+      // own letters are set upright.)
+      const inWord = textWords.some(t => t.bbox.x0 <= r.x1 && t.bbox.x1 >= r.x0 && t.bbox.y0 <= y1 && t.bbox.y1 >= y0);
+      if (w <= W * 0.02 && h <= H * 0.15 && h >= w * 3 && isolated && !inWord && zone(r.x0) && zone(r.x1)) {
         for (let k = r.x0; k <= r.x1; k++) out.push(k);
       }
     });
