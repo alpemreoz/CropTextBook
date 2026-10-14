@@ -11,12 +11,15 @@ import { fileKey, saveFiles, saveSession, loadSession, clearSession } from './se
 
 type ResizeHandle = 'nw' | 'n' | 'ne' | 'e' | 'se' | 's' | 'sw' | 'w';
 
+// While dragging, `cur` is the box as it is now; it is drawn on the canvas
+// directly and written to the page once, on release (updating the pages on
+// every mouse move made the editor lag on large books).
 type DragState =
-  | { mode: 'move'; regionId: string; startNX: number; startNY: number; origBox: BoundingBox }
-  | { mode: 'resize'; regionId: string; handle: ResizeHandle; origBox: BoundingBox }
-  | { mode: 'create'; kind: 'box' | 'passage'; startNX: number; startNY: number }
-  // Passages are shared by several questions: `cur` is the box they all
-  // hold right now, so each drag step can find and update them together.
+  | { mode: 'move'; regionId: string; startNX: number; startNY: number; origBox: BoundingBox; cur: BoundingBox }
+  | { mode: 'resize'; regionId: string; handle: ResizeHandle; origBox: BoundingBox; cur: BoundingBox }
+  | { mode: 'create'; kind: 'box' | 'passage'; startNX: number; startNY: number; cur: BoundingBox }
+  // Passages are shared by several questions: all of them hold `origBox`
+  // until the drag ends.
   | { mode: 'move-passage'; startNX: number; startNY: number; origBox: BoundingBox; cur: BoundingBox }
   | { mode: 'resize-passage'; handle: ResizeHandle; origBox: BoundingBox; cur: BoundingBox };
 
@@ -24,6 +27,9 @@ type DragState =
 type Tool = 'select' | 'box' | 'passage';
 
 const MIN_BOX = 10; // minimum box size in 0-1000 units
+// The edit log goes to the project's logs/ folder when Q-Crop runs on this
+// computer (npm start / npm run dev), else to the server it was opened from.
+const LOGS_LOCAL = ['localhost', '127.0.0.1', '[::1]'].includes(window.location.hostname);
 const MAX_PARALLEL = 3; // pages analyzed at once
 
 /** The book a page belongs to (a PDF, or a numbered image sequence) and its place in it. */
@@ -92,6 +98,143 @@ const handlePoints = (b: BoundingBox): [ResizeHandle, number, number][] => [
   ['sw', b.xmin, b.ymax], ['w', b.xmin, (b.ymin + b.ymax) / 2],
 ];
 
+/** What a page's crop cards can do; App fills it in (see `cropActions`). */
+interface CropActions {
+  select: (regionId: string, pageId: string) => void;
+  editNumber: (regionId: string | null) => void;
+  setNumber: (regionId: string, pageId: string, value: string) => void;
+  removePassage: (regionId: string, pageId: string) => void;
+  download: (region: QuestionRegion, pageId: string) => void;
+  remove: (regionId: string, pageId: string) => void;
+}
+
+/**
+ * One page's section of the crop list. Memoized: a section is drawn again
+ * only when its page (or what is shown with it) changes, so editing one page
+ * of a large book doesn't redraw every other page's crops.
+ */
+const PageCrops = React.memo(function PageCrops({ page, week, topic, missing, answerOf, editingId, actions }: {
+  page: PageData;
+  week?: string;
+  topic?: string;
+  missing?: number[];
+  answerOf: Map<string, string>;
+  editingId: string | null;
+  actions: React.MutableRefObject<CropActions>;
+}) {
+  return (
+    <div id={`page-section-${page.id}`} className="space-y-4 scroll-mt-2">
+      <div className="sticky top-0 z-10 bg-white/90 backdrop-blur py-2 flex flex-col border-b border-slate-100">
+        <div className="flex items-center gap-3">
+          <div className="w-6 h-6 bg-slate-800 text-white rounded-lg flex items-center justify-center text-[10px] font-black">
+            {page.pageNumber}
+          </div>
+          <span className="text-xs font-black text-slate-800 uppercase tracking-widest">Page {page.pageNumber}</span>
+          {week && (
+            <span className="text-[10px] font-black text-brand-700 bg-brand-50 px-2 py-0.5 rounded-md uppercase tracking-wider">
+              {week}. Hafta
+            </span>
+          )}
+        </div>
+        {topic && (
+          <span className="text-[10px] text-slate-400 font-bold truncate mt-1 pl-9">
+            {topic}
+          </span>
+        )}
+        {missing && (
+          <span className="text-[10px] text-red-600 font-bold mt-1 pl-9" title="The printed answers of this test list questions that have no crop: add their boxes by hand or fix their numbers.">
+            Self-check: Q{missing.join(', Q')} of this test not cropped
+          </span>
+        )}
+      </div>
+
+      {[...page.regions].sort((x, y) =>
+        (parseInt(x.questionNumber, 10) - parseInt(y.questionNumber, 10)) || readingOrder(x.box, y.box)).map((region) => (
+        <div 
+          key={region.id}
+          id={`crop-${region.id}`}
+          className={`group relative border-2 rounded-2xl overflow-hidden transition-all duration-300
+            ${region.isSelected ? 'border-brand-500 shadow-xl shadow-brand-50/50 scale-[1.02]' : 'border-slate-100 hover:border-slate-300'}
+          `}
+          onClick={() => actions.current.select(region.id, page.id)}
+        >
+          <div className={`px-4 py-3 flex justify-between items-center transition-colors ${region.isSelected ? 'bg-brand-50' : 'bg-slate-50'}`}>
+            <div className="flex flex-col">
+              {editingId === region.id ? (
+                <input
+                  autoFocus
+                  defaultValue={region.questionNumber}
+                  inputMode="numeric"
+                  onClick={e => e.stopPropagation()}
+                  onFocus={e => e.target.select()}
+                  onBlur={e => actions.current.setNumber(region.id, page.id, e.target.value)}
+                  onKeyDown={e => {
+                    if (e.key === 'Enter') (e.target as HTMLInputElement).blur();
+                    if (e.key === 'Escape') actions.current.editNumber(null);
+                  }}
+                  className="w-16 text-[11px] font-black px-2 py-0.5 rounded-lg border-2 border-brand-500 outline-none"
+                />
+              ) : (
+                <button
+                  onClick={e => { e.stopPropagation(); actions.current.editNumber(region.id); }}
+                  title="Change the question number"
+                  className={`text-[11px] font-black px-2 py-0.5 rounded-lg w-fit flex items-center gap-1 hover:ring-2 hover:ring-brand-300 ${region.isSelected ? 'bg-brand-600 text-white' : 'bg-slate-800 text-white'}`}
+                >
+                  Q{region.questionNumber}
+                  <span className="opacity-60 text-[9px]">✎</span>
+                </button>
+              )}
+              {answerOf.get(region.id) && (
+                <span className="text-[9px] font-black mt-1 px-1.5 py-0.5 rounded-md w-fit bg-emerald-50 text-emerald-700" title="Answer printed in the book">
+                  Answer {answerOf.get(region.id)}
+                </span>
+              )}
+              {page.regions.some(o => o.id !== region.id && o.questionNumber === region.questionNumber) && (
+                <span className="text-[9px] font-bold text-red-600 mt-1">Same number used twice on this page</span>
+              )}
+              <span className="text-[9px] text-slate-400 font-bold mt-1">
+                {region.testNumber ? `Test ${region.testNumber}` : ''}
+              </span>
+              {region.contextBox && (
+                <button
+                  onClick={(e) => { e.stopPropagation(); actions.current.removePassage(region.id, page.id); }}
+                  title="This question shares a passage with others; click to crop it without the passage"
+                  className="text-[9px] font-bold mt-1 px-1.5 py-0.5 rounded-md w-fit bg-purple-100 text-purple-700 hover:bg-red-100 hover:text-red-700 transition-colors"
+                >
+                  + passage ✕
+                </button>
+              )}
+            </div>
+            <div className="flex items-center">
+              <button
+                onClick={(e) => { e.stopPropagation(); actions.current.download(region, page.id); }}
+                className="text-slate-400 hover:text-brand-600 p-2 rounded-xl hover:bg-white transition-all"
+              >
+                 <DownloadIcon className="w-5 h-5" />
+              </button>
+              <button
+                onClick={(e) => { e.stopPropagation(); actions.current.remove(region.id, page.id); }}
+                title="Delete this crop (or select its box on the page and press Delete)"
+                className="text-slate-400 hover:text-red-600 p-2 rounded-xl hover:bg-white transition-all"
+              >
+                 <TrashIcon className="w-5 h-5" />
+              </button>
+            </div>
+          </div>
+          
+          <div className="bg-white p-4">
+            {region.croppedDataUrl ? (
+               <img src={region.croppedDataUrl} className="w-full h-auto max-h-64 object-contain rounded-xl border border-slate-50" />
+            ) : (
+               <div className="w-full h-24 flex items-center justify-center bg-slate-50 rounded-xl animate-pulse text-[10px] font-bold text-slate-300 uppercase tracking-widest">Cleaning...</div>
+            )}
+          </div>
+        </div>
+      ))}
+    </div>
+  );
+});
+
 export default function App() {
   const [pages, setPages] = useState<PageData[]>([]);
   const [activePageId, setActivePageId] = useState<string | null>(null);
@@ -105,7 +248,6 @@ export default function App() {
   const containerRef = useRef<HTMLDivElement>(null);
   const [containerSize, setContainerSize] = useState({ w: 0, h: 0 });
   const [tool, setTool] = useState<Tool>('select');
-  const [draftBox, setDraftBox] = useState<BoundingBox | null>(null);
   // The shared passage being edited (moved, resized, assigned to questions).
   const [selectedPassage, setSelectedPassage] = useState<BoundingBox | null>(null);
   const [editingNumberId, setEditingNumberId] = useState<string | null>(null);
@@ -185,7 +327,7 @@ export default function App() {
   }, [busy]);
 
   // Drawing tools and the passage panel belong to the page they were used on.
-  useEffect(() => { setTool('select'); setSelectedPassage(null); setDraftBox(null); }, [activePageId]);
+  useEffect(() => { setTool('select'); setSelectedPassage(null); dragRef.current = null; }, [activePageId]);
 
   // Esc cancels drawing and closes the passage panel; Delete/Backspace
   // removes the selected crop (or the selected passage); the left and right
@@ -194,7 +336,7 @@ export default function App() {
     const onKey = (e: KeyboardEvent) => {
       if (['INPUT', 'SELECT', 'TEXTAREA'].includes((e.target as HTMLElement)?.tagName)) return;
       if (e.key === 'Escape') {
-        setTool('select'); setSelectedPassage(null); setDraftBox(null); dragRef.current = null;
+        setTool('select'); setSelectedPassage(null); dragRef.current = null; redraw();
       } else if ((e.key === 'ArrowLeft' || e.key === 'ArrowRight') && !e.metaKey && !e.ctrlKey && !e.altKey && dragRef.current === null) {
         e.preventDefault();
         goPage(e.key === 'ArrowLeft' ? -1 : 1);
@@ -261,6 +403,14 @@ export default function App() {
     pages.find(p => p.id === activePageId), [pages, activePageId]
   );
 
+  // The book-wide results below (weeks, names, answers, checks) depend on
+  // each page's analysis and its question numbers, not on where boxes sit or
+  // which one is selected: they are worked out again only when those change.
+  // (On a 300-page book, redoing them for every edit made the editor lag.)
+  const bookKey = useMemo(() => pages.map(p =>
+    `${p.id}:${p.status}:${p.regions.map(r => `${r.id}=${r.questionNumber}`).join(',')}`).join('|'), [pages]);
+  const bookPages = useMemo(() => pages, [bookKey]);
+
   // Previous/next page (buttons beside the page, arrow keys); the crop list
   // follows, as when a thumbnail is picked.
   const goPage = (delta: number) => {
@@ -279,7 +429,7 @@ export default function App() {
   const weekByPage = useMemo(() => {
     const out = new Map<string, string | undefined>();
     const byBook = new Map<string, { page: PageData; order: number }[]>();
-    for (const p of pages) {
+    for (const p of bookPages) {
       const book = bookOf(p);
       if (!book) { out.set(p.id, p.section ? undefined : p.week); continue; }
       if (!byBook.has(book.key)) byBook.set(book.key, []);
@@ -293,7 +443,7 @@ export default function App() {
       group.forEach(({ page }, i) => out.set(page.id, resolved[i]));
     }
     return out;
-  }, [pages]);
+  }, [bookPages]);
 
   // Books with a table of contents and an answer key (profiles with
   // `bookIndex`): each page's test from the contents, its answers from the
@@ -304,13 +454,13 @@ export default function App() {
     const missingOn = new Map<string, number[]>(); // page id -> key numbers its test lacks
     if (!profileOptions(profile).bookIndex) return { nameOf, answerOf, missingOn };
     const byBook = new Map<string, PageData[]>();
-    for (const p of pages) {
+    for (const p of bookPages) {
       if (!p.pdf || p.status !== 'READY' || !p.contents) continue;
       if (!byBook.has(p.pdf.source)) byBook.set(p.pdf.source, []);
       byBook.get(p.pdf.source)!.push(p);
     }
     for (const group of byBook.values()) {
-      const total = pages.filter(p => p.pdf?.source === group[0].pdf!.source).length;
+      const total = bookPages.filter(p => p.pdf?.source === group[0].pdf!.source).length;
       const holdTests = !!profileOptions(profile).headerTest;
       const contents = bookContents(group.map(p => ({ pdfPage: p.pdf!.pageIndex, ...p.contents })), total, { entriesHoldTests: holdTests });
       // (Entries holding several tests: each page's own test is found in the key.)
@@ -338,7 +488,7 @@ export default function App() {
       }
     }
     return { nameOf, answerOf, missingOn };
-  }, [pages, profile]);
+  }, [bookPages, profile]);
 
   // Printed answers vs crops (profiles with answer keys), per book: each
   // crop's answer, and per page the questions its test is missing. Answers
@@ -346,12 +496,12 @@ export default function App() {
   const answerCheck = useMemo(() => {
     const answerOf = new Map<string, string>(bookIndex.answerOf); // region id -> letter
     const missingOn = new Map<string, number[]>(bookIndex.missingOn); // page id -> missing numbers of its test
-    for (const p of pages) for (const r of p.regions) {
+    for (const p of bookPages) for (const r of p.regions) {
       const letter = p.marked?.[r.questionNumber];
       if (letter && !answerOf.has(r.id)) answerOf.set(r.id, letter);
     }
     const byBook = new Map<string, { page: PageData; order: number }[]>();
-    for (const p of pages) {
+    for (const p of bookPages) {
       if (!p.answers || p.status !== 'READY') continue;
       const book = bookOf(p) ?? { key: `page:${p.id}`, order: 0 };
       if (!byBook.has(book.key)) byBook.set(book.key, []);
@@ -372,7 +522,7 @@ export default function App() {
       }
     }
     return { answerOf, missingOn };
-  }, [pages, bookIndex]);
+  }, [bookPages, bookIndex]);
 
   // Profiles naming per test: a test's number and topic come from whichever
   // of its pages read them (the most common reading wins).
@@ -381,12 +531,12 @@ export default function App() {
     const topicOf = new Map<string, string | undefined>();
     // Names from the table of contents ("1 ünite Çarpanlar ve Katlar Doğrula - 1").
     if (profileOptions(profile).bookIndex) {
-      for (const p of pages) if (bookIndex.nameOf.has(p.id)) { testOf.set(p.id, undefined); topicOf.set(p.id, bookIndex.nameOf.get(p.id)); }
+      for (const p of bookPages) if (bookIndex.nameOf.has(p.id)) { testOf.set(p.id, undefined); topicOf.set(p.id, bookIndex.nameOf.get(p.id)); }
       return { testOf, topicOf };
     }
     if (!profileOptions(profile).namesPerTest) return { testOf, topicOf };
     const byBook = new Map<string, { page: PageData; order: number }[]>();
-    for (const p of pages) {
+    for (const p of bookPages) {
       if (p.status !== 'READY') continue;
       const book = bookOf(p) ?? { key: `page:${p.id}`, order: 0 };
       if (!byBook.has(book.key)) byBook.set(book.key, []);
@@ -404,7 +554,7 @@ export default function App() {
       }
     }
     return { testOf, topicOf };
-  }, [pages, profile, bookIndex]);
+  }, [bookPages, profile, bookIndex]);
 
   /** The topic shown and used for a page: per test under profiles that name per test. */
   const pageTopic = (pageId: string) =>
@@ -413,7 +563,7 @@ export default function App() {
   const topicByPage = useMemo(() => {
     const out = new Map<string, string | undefined>();
     const byBook = new Map<string, { page: PageData; order: number }[]>();
-    for (const p of pages) {
+    for (const p of bookPages) {
       const book = bookOf(p);
       if (!book) { out.set(p.id, p.topic); continue; }
       if (!byBook.has(book.key)) byBook.set(book.key, []);
@@ -427,7 +577,7 @@ export default function App() {
       group.forEach(({ page }, i) => out.set(page.id, resolved[i]));
     }
     return out;
-  }, [pages]);
+  }, [bookPages]);
 
   const handleImagesSelected = useCallback(async (newFiles: LoadedPage[]) => {
     const newPages: PageData[] = newFiles.map(f => ({
@@ -637,110 +787,132 @@ export default function App() {
     }
   }
 
-  // Canvas Drawing Logic
+  // Canvas Drawing Logic. `drawRef` redraws with the box being dragged (see
+  // DragState) without a React update.
+  const drawRef = useRef<() => void>(() => {});
+  const selectedPassageState = selectedPassage, toolState = tool;
+  const frameRef = useRef(0);
+  const redraw = () => {
+    if (frameRef.current) return;
+    frameRef.current = requestAnimationFrame(() => { frameRef.current = 0; drawRef.current(); });
+  };
   useEffect(() => {
-    if (!activePage || !activePage.imageObj || !canvasRef.current || !containerRef.current) return;
+    if (!activePage || !activePage.imageObj || !canvasRef.current || !containerRef.current) { drawRef.current = () => {}; return; }
+    const draw = () => {
+      const canvas = canvasRef.current;
+      const ctx = canvas?.getContext('2d');
+      if (!canvas || !ctx) return;
 
-    const canvas = canvasRef.current;
-    const ctx = canvas.getContext('2d');
-    if (!ctx) return;
-
-    const container = containerRef.current;
-    const { imageObj, regions, status } = activePage;
-
-    const containerRatio = container.clientWidth / container.clientHeight;
-    const imageRatio = imageObj.width / imageObj.height;
-
-    let drawWidth = container.clientWidth;
-    let drawHeight = container.clientHeight;
-
-    if (containerRatio > imageRatio) {
-      drawWidth = drawHeight * imageRatio;
-    } else {
-      drawHeight = drawWidth / imageRatio;
-    }
-
-    canvas.width = drawWidth;
-    canvas.height = drawHeight;
-    ctx.drawImage(imageObj, 0, 0, drawWidth, drawHeight);
-
-    if (status === 'READY') {
-      // Shared passages: one box each, labelled with the questions using it.
-      // The selected one is drawn even before any question uses it.
-      const passages = new Map<string, BoundingBox>();
-      regions.forEach(r => { if (r.contextBox) passages.set(boxKey(r.contextBox), r.contextBox); });
-      if (selectedPassage) passages.set(boxKey(selectedPassage), selectedPassage);
-      const selKey = boxKey(selectedPassage ?? undefined);
-      // Boxes are drawn with the margin the export adds (cropRect), so what
-      // is on screen is what gets exported.
-      const shown = (b: BoundingBox) => { const r = cropRect(b, drawWidth, drawHeight); return { x: r.sx, y: r.sy, w: r.sw, h: r.sh }; };
-      passages.forEach((c, key) => {
-        const isSel = key === selKey;
-        const pr = shown(c);
-        ctx.beginPath();
-        ctx.rect(pr.x, pr.y, pr.w, pr.h);
-        ctx.fillStyle = isSel ? 'rgba(168, 85, 247, 0.18)' : 'rgba(168, 85, 247, 0.10)';
-        ctx.fill();
-        ctx.lineWidth = isSel ? 2.5 : 1.5;
-        if (!isSel) ctx.setLineDash([6, 4]);
-        ctx.strokeStyle = isSel ? 'rgb(126, 34, 206)' : 'rgba(147, 51, 234, 0.8)'; ctx.stroke(); ctx.setLineDash([]);
-        const nums = regions.filter(r => boxKey(r.contextBox) === key)
-          .map(r => r.questionNumber).sort((x, y) => parseInt(x, 10) - parseInt(y, 10));
-        const label = nums.length ? `Passage Q${nums.join(', Q')}` : 'Passage (pick questions)';
-        ctx.font = 'bold 11px sans-serif';
-        const tx = pr.x, ty = pr.y;
-        ctx.fillStyle = isSel ? 'rgb(126, 34, 206)' : 'rgba(147, 51, 234, 0.9)';
-        ctx.fillRect(tx, ty - 16, ctx.measureText(label).width + 10, 16);
-        ctx.fillStyle = '#fff'; ctx.fillText(label, tx + 5, ty - 4);
+      const container = containerRef.current!;
+      const { imageObj, status } = activePage;
+      // (The box being dragged, as it is now.)
+      const drag = dragRef.current;
+      const passageFrom = drag && (drag.mode === 'move-passage' || drag.mode === 'resize-passage') ? boxKey(drag.origBox) : null;
+      const regions = activePage.regions.map(r => {
+        if (drag && (drag.mode === 'move' || drag.mode === 'resize') && r.id === drag.regionId) return { ...r, box: drag.cur };
+        if (passageFrom && boxKey(r.contextBox) === passageFrom) return { ...r, contextBox: drag!.cur };
+        return r;
       });
+      const selectedPassage = passageFrom ? drag!.cur : selectedPassageState;
+      const draftBox = drag?.mode === 'create' ? drag.cur : null;
+      const tool = drag?.mode === 'create' ? drag.kind : toolState;
 
-      // Draw Questions
-      regions.forEach(region => {
-        const { x: startX, y: startY, w: width, h: height } = shown(region.box);
+      const containerRatio = container.clientWidth / container.clientHeight;
+      const imageRatio = imageObj.width / imageObj.height;
 
-        ctx.beginPath(); ctx.rect(startX, startY, width, height);
-        if (region.isSelected) {
-          ctx.fillStyle = 'rgba(34, 197, 94, 0.2)'; ctx.lineWidth = 2; ctx.strokeStyle = '#16a34a';
-        } else {
-           ctx.fillStyle = 'rgba(59, 130, 246, 0.1)'; ctx.lineWidth = 1.5; ctx.strokeStyle = 'rgba(59, 130, 246, 0.6)';
-        }
-        ctx.fill(); ctx.stroke();
+      let drawWidth = container.clientWidth;
+      let drawHeight = container.clientHeight;
 
-        ctx.fillStyle = region.isSelected ? '#16a34a' : 'rgba(59, 130, 246, 0.8)';
-        ctx.font = 'bold 12px sans-serif';
-        const text = `Q${region.questionNumber}`;
-        const textMetrics = ctx.measureText(text);
-        ctx.fillRect(startX, startY - 20 > 0 ? startY - 20 : startY, textMetrics.width + 12, 20);
-        ctx.fillStyle = 'white'; ctx.fillText(text, startX + 6, (startY - 20 > 0 ? startY - 6 : startY + 14));
-      });
-
-      // Resize handles on the selected box or passage
-      const drawHandles = (box: BoundingBox, color: string) => {
-        // (On the drawn outline, which includes the export margin.)
-        const r = shown(box);
-        const outline = { xmin: (r.x / drawWidth) * 1000, ymin: (r.y / drawHeight) * 1000, xmax: ((r.x + r.w) / drawWidth) * 1000, ymax: ((r.y + r.h) / drawHeight) * 1000 };
-        handlePoints(outline).forEach(([, hx, hy]) => {
-          const px = (hx / 1000) * drawWidth, py = (hy / 1000) * drawHeight;
-          ctx.fillStyle = '#fff'; ctx.strokeStyle = color; ctx.lineWidth = 1.5;
-          ctx.fillRect(px - 5, py - 5, 10, 10);
-          ctx.strokeRect(px - 5, py - 5, 10, 10);
-        });
-      };
-      const sel = regions.find(r => r.isSelected);
-      if (sel) drawHandles(sel.box, '#16a34a');
-      if (selectedPassage) drawHandles(selectedPassage, 'rgb(126, 34, 206)');
-
-      // Draft box while drawing a new question box (green) or passage (purple)
-      if (draftBox) {
-        const purple = tool === 'passage';
-        ctx.beginPath();
-        ctx.rect((draftBox.xmin / 1000) * drawWidth, (draftBox.ymin / 1000) * drawHeight,
-          ((draftBox.xmax - draftBox.xmin) / 1000) * drawWidth, ((draftBox.ymax - draftBox.ymin) / 1000) * drawHeight);
-        ctx.setLineDash([6, 4]); ctx.strokeStyle = purple ? 'rgb(126, 34, 206)' : '#16a34a'; ctx.lineWidth = 2; ctx.stroke(); ctx.setLineDash([]);
-        ctx.fillStyle = purple ? 'rgba(168, 85, 247, 0.10)' : 'rgba(34, 197, 94, 0.08)'; ctx.fill();
+      if (containerRatio > imageRatio) {
+        drawWidth = drawHeight * imageRatio;
+      } else {
+        drawHeight = drawWidth / imageRatio;
       }
-    }
-  }, [activePage, containerSize, draftBox, selectedPassage, tool]);
+
+      canvas.width = drawWidth;
+      canvas.height = drawHeight;
+      ctx.drawImage(imageObj, 0, 0, drawWidth, drawHeight);
+
+      if (status === 'READY') {
+        // Shared passages: one box each, labelled with the questions using it.
+        // The selected one is drawn even before any question uses it.
+        const passages = new Map<string, BoundingBox>();
+        regions.forEach(r => { if (r.contextBox) passages.set(boxKey(r.contextBox), r.contextBox); });
+        if (selectedPassage) passages.set(boxKey(selectedPassage), selectedPassage);
+        const selKey = boxKey(selectedPassage ?? undefined);
+        // Boxes are drawn with the margin the export adds (cropRect), so what
+        // is on screen is what gets exported.
+        const shown = (b: BoundingBox) => { const r = cropRect(b, drawWidth, drawHeight); return { x: r.sx, y: r.sy, w: r.sw, h: r.sh }; };
+        passages.forEach((c, key) => {
+          const isSel = key === selKey;
+          const pr = shown(c);
+          ctx.beginPath();
+          ctx.rect(pr.x, pr.y, pr.w, pr.h);
+          ctx.fillStyle = isSel ? 'rgba(168, 85, 247, 0.18)' : 'rgba(168, 85, 247, 0.10)';
+          ctx.fill();
+          ctx.lineWidth = isSel ? 2.5 : 1.5;
+          if (!isSel) ctx.setLineDash([6, 4]);
+          ctx.strokeStyle = isSel ? 'rgb(126, 34, 206)' : 'rgba(147, 51, 234, 0.8)'; ctx.stroke(); ctx.setLineDash([]);
+          const nums = regions.filter(r => boxKey(r.contextBox) === key)
+            .map(r => r.questionNumber).sort((x, y) => parseInt(x, 10) - parseInt(y, 10));
+          const label = nums.length ? `Passage Q${nums.join(', Q')}` : 'Passage (pick questions)';
+          ctx.font = 'bold 11px sans-serif';
+          const tx = pr.x, ty = pr.y;
+          ctx.fillStyle = isSel ? 'rgb(126, 34, 206)' : 'rgba(147, 51, 234, 0.9)';
+          ctx.fillRect(tx, ty - 16, ctx.measureText(label).width + 10, 16);
+          ctx.fillStyle = '#fff'; ctx.fillText(label, tx + 5, ty - 4);
+        });
+
+        // Draw Questions
+        regions.forEach(region => {
+          const { x: startX, y: startY, w: width, h: height } = shown(region.box);
+
+          ctx.beginPath(); ctx.rect(startX, startY, width, height);
+          if (region.isSelected) {
+            ctx.fillStyle = 'rgba(34, 197, 94, 0.2)'; ctx.lineWidth = 2; ctx.strokeStyle = '#16a34a';
+          } else {
+             ctx.fillStyle = 'rgba(59, 130, 246, 0.1)'; ctx.lineWidth = 1.5; ctx.strokeStyle = 'rgba(59, 130, 246, 0.6)';
+          }
+          ctx.fill(); ctx.stroke();
+
+          ctx.fillStyle = region.isSelected ? '#16a34a' : 'rgba(59, 130, 246, 0.8)';
+          ctx.font = 'bold 12px sans-serif';
+          const text = `Q${region.questionNumber}`;
+          const textMetrics = ctx.measureText(text);
+          ctx.fillRect(startX, startY - 20 > 0 ? startY - 20 : startY, textMetrics.width + 12, 20);
+          ctx.fillStyle = 'white'; ctx.fillText(text, startX + 6, (startY - 20 > 0 ? startY - 6 : startY + 14));
+        });
+
+        // Resize handles on the selected box or passage
+        const drawHandles = (box: BoundingBox, color: string) => {
+          // (On the drawn outline, which includes the export margin.)
+          const r = shown(box);
+          const outline = { xmin: (r.x / drawWidth) * 1000, ymin: (r.y / drawHeight) * 1000, xmax: ((r.x + r.w) / drawWidth) * 1000, ymax: ((r.y + r.h) / drawHeight) * 1000 };
+          handlePoints(outline).forEach(([, hx, hy]) => {
+            const px = (hx / 1000) * drawWidth, py = (hy / 1000) * drawHeight;
+            ctx.fillStyle = '#fff'; ctx.strokeStyle = color; ctx.lineWidth = 1.5;
+            ctx.fillRect(px - 5, py - 5, 10, 10);
+            ctx.strokeRect(px - 5, py - 5, 10, 10);
+          });
+        };
+        const sel = regions.find(r => r.isSelected);
+        if (sel) drawHandles(sel.box, '#16a34a');
+        if (selectedPassage) drawHandles(selectedPassage, 'rgb(126, 34, 206)');
+
+        // Draft box while drawing a new question box (green) or passage (purple)
+        if (draftBox) {
+          const purple = tool === 'passage';
+          ctx.beginPath();
+          ctx.rect((draftBox.xmin / 1000) * drawWidth, (draftBox.ymin / 1000) * drawHeight,
+            ((draftBox.xmax - draftBox.xmin) / 1000) * drawWidth, ((draftBox.ymax - draftBox.ymin) / 1000) * drawHeight);
+          ctx.setLineDash([6, 4]); ctx.strokeStyle = purple ? 'rgb(126, 34, 206)' : '#16a34a'; ctx.lineWidth = 2; ctx.stroke(); ctx.setLineDash([]);
+          ctx.fillStyle = purple ? 'rgba(168, 85, 247, 0.10)' : 'rgba(34, 197, 94, 0.08)'; ctx.fill();
+        }
+      }
+    };
+    drawRef.current = draw;
+    draw();
+  }, [activePage, containerSize, selectedPassageState, toolState]);
 
   /**
    * A question's image: the question box (number masked out when inside it),
@@ -781,12 +953,6 @@ export default function App() {
     };
   };
 
-  const updateRegionBox = (regionId: string, box: BoundingBox) => {
-    setPages(prev => prev.map(p => p.id !== activePageId ? p : {
-      ...p, regions: p.regions.map(r => r.id === regionId ? { ...r, box } : r)
-    }));
-  };
-
   const recrop = (p: PageData, r: QuestionRegion): QuestionRegion =>
     p.imageObj ? { ...r, croppedDataUrl: cropImage(p.imageObj, r.box, r.contextBox, r.mask) } : r;
 
@@ -797,20 +963,7 @@ export default function App() {
     }));
   };
 
-  const refreshCrop = (regionId: string) => {
-    if (activePageId) editRegions(activePageId, r => r.id === regionId ? { ...r } : r);
-  };
-
   // --- Shared passages ---------------------------------------------------------
-
-  /** Moves every question using passage `from` over to box `to` (no recrop). */
-  const movePassage = (from: BoundingBox, to: BoundingBox) => {
-    const key = boxKey(from);
-    setPages(prev => prev.map(p => p.id !== activePageId ? p : {
-      ...p, regions: p.regions.map(r => boxKey(r.contextBox) === key ? { ...r, contextBox: to } : r),
-    }));
-    setSelectedPassage(to);
-  };
 
   /** Uses (or stops using) the selected passage for one question. */
   const togglePassageFor = (regionId: string, on: boolean) => {
@@ -889,8 +1042,8 @@ export default function App() {
     const { nx, ny, tolX, tolY } = canvasNorm(e);
 
     if (tool !== 'select') {
-      dragRef.current = { mode: 'create', kind: tool, startNX: nx, startNY: ny };
-      setDraftBox({ xmin: nx, ymin: ny, xmax: nx, ymax: ny });
+      dragRef.current = { mode: 'create', kind: tool, startNX: nx, startNY: ny, cur: { xmin: nx, ymin: ny, xmax: nx, ymax: ny } };
+      redraw();
       return;
     }
 
@@ -907,7 +1060,7 @@ export default function App() {
     if (sel) {
       const handle = onHandle(sel.box);
       if (handle) {
-        dragRef.current = { mode: 'resize', regionId: sel.id, handle, origBox: { ...sel.box } };
+        dragRef.current = { mode: 'resize', regionId: sel.id, handle, origBox: { ...sel.box }, cur: sel.box };
         return;
       }
     }
@@ -918,7 +1071,7 @@ export default function App() {
       setSelectedPassage(null);
       if (!hit.isSelected) handleSelectRegion(hit.id, activePage.id);
       revealInList(`crop-${hit.id}`, 'nearest');
-      dragRef.current = { mode: 'move', regionId: hit.id, startNX: nx, startNY: ny, origBox: { ...hit.box } };
+      dragRef.current = { mode: 'move', regionId: hit.id, startNX: nx, startNY: ny, origBox: { ...hit.box }, cur: hit.box };
       return;
     }
     const passage = [selectedPassage, ...activePage.regions.map(r => r.contextBox)]
@@ -955,31 +1108,26 @@ export default function App() {
     };
 
     if (drag.mode === 'create') {
-      setDraftBox({
+      drag.cur = {
         xmin: Math.min(drag.startNX, nx), ymin: Math.min(drag.startNY, ny),
         xmax: Math.max(drag.startNX, nx), ymax: Math.max(drag.startNY, ny),
-      });
-    } else if (drag.mode === 'move') {
-      updateRegionBox(drag.regionId, moved(drag.origBox, drag.startNX, drag.startNY));
-    } else if (drag.mode === 'resize') {
-      updateRegionBox(drag.regionId, resized(drag.origBox, drag.handle));
+      };
+    } else if (drag.mode === 'move' || drag.mode === 'move-passage') {
+      drag.cur = moved(drag.origBox, drag.startNX, drag.startNY);
     } else {
-      const to = drag.mode === 'move-passage'
-        ? moved(drag.origBox, drag.startNX, drag.startNY)
-        : resized(drag.origBox, drag.handle);
-      movePassage(drag.cur, to);
-      drag.cur = to;
+      drag.cur = resized(drag.origBox, drag.handle);
     }
+    redraw();
   };
 
   const handleCanvasMouseUp = () => {
     const drag = dragRef.current;
     dragRef.current = null;
-    if (!drag || !activePage) { setDraftBox(null); return; }
+    if (!drag || !activePage) { redraw(); return; }
 
     if (drag.mode === 'create') {
-      const b = draftBox;
-      setDraftBox(null);
+      const b = drag.cur;
+      redraw();
       setTool('select');
       if (!b || b.xmax - b.xmin < MIN_BOX || b.ymax - b.ymin < MIN_BOX || !activePage.imageObj) return;
       const box: BoundingBox = {
@@ -1012,28 +1160,33 @@ export default function App() {
       }));
       logEdit('box_added', activePage, regionInfo(newRegion));
     } else if (drag.mode === 'move-passage' || drag.mode === 'resize-passage') {
-      const key = boxKey(drag.cur);
-      editRegions(activePage.id, r => boxKey(r.contextBox) === key ? { ...r } : r);
-      if (!sameBox(drag.origBox, drag.cur)) {
+      // The questions holding the passage get it where it was dropped.
+      const from = boxKey(drag.origBox), to = drag.cur;
+      if (sameBox(drag.origBox, to)) return;
+      editRegions(activePage.id, r => boxKey(r.contextBox) === from ? { ...r, contextBox: to } : r);
+      setSelectedPassage(to);
+      const key = from;
+      {
         logEdit(drag.mode === 'move-passage' ? 'passage_moved' : 'passage_resized', activePage, {
           ...(drag.mode === 'resize-passage' && { handle: drag.handle }),
-          from: roundBox(drag.origBox), to: roundBox(drag.cur), edges: edgeDelta(drag.origBox, drag.cur),
+          from: roundBox(drag.origBox), to: roundBox(to), edges: edgeDelta(drag.origBox, to),
           usedBy: activePage.regions.filter(r => boxKey(r.contextBox) === key).map(r => r.questionNumber),
         });
       }
     } else {
-      refreshCrop(drag.regionId);
       // A click that only selected the box changes nothing.
       const r = activePage.regions.find(x => x.id === drag.regionId);
-      if (r && !sameBox(drag.origBox, r.box)) {
+      const box = drag.cur;
+      if (r && !sameBox(drag.origBox, box)) {
+        editRegions(activePage.id, x => x.id === r.id ? { ...x, box } : x);
         const original = detectedRef.current.get(r.id);
         logEdit(drag.mode === 'move' ? 'box_moved' : 'box_resized', activePage, {
           rid: r.id, n: r.questionNumber,
           ...(drag.mode === 'resize' && { handle: drag.handle }),
-          from: roundBox(drag.origBox), to: roundBox(r.box), edges: edgeDelta(drag.origBox, r.box),
+          from: roundBox(drag.origBox), to: roundBox(box), edges: edgeDelta(drag.origBox, box),
           detected: !!original,
           // Change against what the program found (after several drags).
-          ...(original && { detectedBox: roundBox(original.box), fromDetected: edgeDelta(original.box, r.box) }),
+          ...(original && { detectedBox: roundBox(original.box), fromDetected: edgeDelta(original.box, box) }),
         });
       }
     }
@@ -1137,6 +1290,18 @@ export default function App() {
   };
 
   const allQuestions = useMemo(() => pages.flatMap(p => p.regions), [pages]);
+
+  // The crop list's actions, current on every render, behind one stable ref
+  // (so the memoized page sections don't redraw for new function identities).
+  const cropActions = useRef<CropActions>(null!);
+  cropActions.current = {
+    select: (regionId, pageId) => { setActivePageId(pageId); handleSelectRegion(regionId, pageId); },
+    editNumber: setEditingNumberId,
+    setNumber: setQuestionNumber,
+    removePassage: handleRemovePassage,
+    download: handleDownloadCrop,
+    remove: handleDeleteRegion,
+  };
 
   return (
     <>
@@ -1359,9 +1524,15 @@ export default function App() {
                   {exportProgress ? <LoaderIcon className="w-5 h-5 animate-spin" /> : <DownloadIcon className="w-5 h-5" />}
                   {exportProgress ? `Exporting ${exportProgress}` : 'Export All (Auto-Named)'}
                 </button>
-                <p className="text-[10px] text-slate-400 font-semibold mt-3 text-center" title="What the program found and how you corrected it is saved to the logs folder of this project, on this computer. It helps improve the automatic detection.">
-                  Your corrections are saved to <span className="font-mono">logs/</span> on this computer to improve Q-Crop.
-                </p>
+                {LOGS_LOCAL ? (
+                  <p className="text-[10px] text-slate-400 font-semibold mt-3 text-center" title="What the program found and how you corrected it is saved to the logs folder of this project, on this computer. It helps improve the automatic detection.">
+                    Your corrections are saved to <span className="font-mono">logs/</span> on this computer to improve Q-Crop.
+                  </p>
+                ) : (
+                  <p className="text-[10px] text-slate-400 font-semibold mt-3 text-center" title="What the program found and how you corrected the boxes (positions, question numbers, page numbers, book file names) is sent to the server Q-Crop was opened from. Your books and crops stay on this computer. It helps improve the automatic detection.">
+                    Your box corrections are sent to the Q-Crop server to improve it. Your books and crops stay on this computer.
+                  </p>
+                )}
               </div>
 
                 {activePage?.status === 'READY' && selectedPassage && (
@@ -1402,115 +1573,16 @@ export default function App() {
                 )}
               <div className="flex-1 overflow-y-auto p-6 space-y-8 no-scrollbar">
                 {pages.map(page => (
-                  <div key={page.id} id={`page-section-${page.id}`} className="space-y-4 scroll-mt-2">
-                    <div className="sticky top-0 z-10 bg-white/90 backdrop-blur py-2 flex flex-col border-b border-slate-100">
-                      <div className="flex items-center gap-3">
-                        <div className="w-6 h-6 bg-slate-800 text-white rounded-lg flex items-center justify-center text-[10px] font-black">
-                          {page.pageNumber}
-                        </div>
-                        <span className="text-xs font-black text-slate-800 uppercase tracking-widest">Page {page.pageNumber}</span>
-                        {weekByPage.get(page.id) && (
-                          <span className="text-[10px] font-black text-brand-700 bg-brand-50 px-2 py-0.5 rounded-md uppercase tracking-wider">
-                            {weekByPage.get(page.id)}. Hafta
-                          </span>
-                        )}
-                      </div>
-                      {pageTopic(page.id) && (
-                        <span className="text-[10px] text-slate-400 font-bold truncate mt-1 pl-9">
-                          {pageTopic(page.id)}
-                        </span>
-                      )}
-                      {answerCheck.missingOn.get(page.id) && (
-                        <span className="text-[10px] text-red-600 font-bold mt-1 pl-9" title="The printed answers of this test list questions that have no crop: add their boxes by hand or fix their numbers.">
-                          Self-check: Q{answerCheck.missingOn.get(page.id)!.join(', Q')} of this test not cropped
-                        </span>
-                      )}
-                    </div>
-
-                    {[...page.regions].sort((x, y) =>
-                      (parseInt(x.questionNumber, 10) - parseInt(y.questionNumber, 10)) || readingOrder(x.box, y.box)).map((region) => (
-                      <div 
-                        key={region.id}
-                        id={`crop-${region.id}`}
-                        className={`group relative border-2 rounded-2xl overflow-hidden transition-all duration-300
-                          ${region.isSelected ? 'border-brand-500 shadow-xl shadow-brand-50/50 scale-[1.02]' : 'border-slate-100 hover:border-slate-300'}
-                        `}
-                        onClick={() => { setActivePageId(page.id); handleSelectRegion(region.id, page.id); }}
-                      >
-                        <div className={`px-4 py-3 flex justify-between items-center transition-colors ${region.isSelected ? 'bg-brand-50' : 'bg-slate-50'}`}>
-                          <div className="flex flex-col">
-                            {editingNumberId === region.id ? (
-                              <input
-                                autoFocus
-                                defaultValue={region.questionNumber}
-                                inputMode="numeric"
-                                onClick={e => e.stopPropagation()}
-                                onFocus={e => e.target.select()}
-                                onBlur={e => setQuestionNumber(region.id, page.id, e.target.value)}
-                                onKeyDown={e => {
-                                  if (e.key === 'Enter') (e.target as HTMLInputElement).blur();
-                                  if (e.key === 'Escape') setEditingNumberId(null);
-                                }}
-                                className="w-16 text-[11px] font-black px-2 py-0.5 rounded-lg border-2 border-brand-500 outline-none"
-                              />
-                            ) : (
-                              <button
-                                onClick={e => { e.stopPropagation(); setEditingNumberId(region.id); }}
-                                title="Change the question number"
-                                className={`text-[11px] font-black px-2 py-0.5 rounded-lg w-fit flex items-center gap-1 hover:ring-2 hover:ring-brand-300 ${region.isSelected ? 'bg-brand-600 text-white' : 'bg-slate-800 text-white'}`}
-                              >
-                                Q{region.questionNumber}
-                                <span className="opacity-60 text-[9px]">✎</span>
-                              </button>
-                            )}
-                            {answerCheck.answerOf.get(region.id) && (
-                              <span className="text-[9px] font-black mt-1 px-1.5 py-0.5 rounded-md w-fit bg-emerald-50 text-emerald-700" title="Answer printed in the book">
-                                Answer {answerCheck.answerOf.get(region.id)}
-                              </span>
-                            )}
-                            {page.regions.some(o => o.id !== region.id && o.questionNumber === region.questionNumber) && (
-                              <span className="text-[9px] font-bold text-red-600 mt-1">Same number used twice on this page</span>
-                            )}
-                            <span className="text-[9px] text-slate-400 font-bold mt-1">
-                              {region.testNumber ? `Test ${region.testNumber}` : ''}
-                            </span>
-                            {region.contextBox && (
-                              <button
-                                onClick={(e) => { e.stopPropagation(); handleRemovePassage(region.id, page.id); }}
-                                title="This question shares a passage with others; click to crop it without the passage"
-                                className="text-[9px] font-bold mt-1 px-1.5 py-0.5 rounded-md w-fit bg-purple-100 text-purple-700 hover:bg-red-100 hover:text-red-700 transition-colors"
-                              >
-                                + passage ✕
-                              </button>
-                            )}
-                          </div>
-                          <div className="flex items-center">
-                            <button
-                              onClick={(e) => { e.stopPropagation(); handleDownloadCrop(region, page.id); }}
-                              className="text-slate-400 hover:text-brand-600 p-2 rounded-xl hover:bg-white transition-all"
-                            >
-                               <DownloadIcon className="w-5 h-5" />
-                            </button>
-                            <button
-                              onClick={(e) => { e.stopPropagation(); handleDeleteRegion(region.id, page.id); }}
-                              title="Delete this crop (or select its box on the page and press Delete)"
-                              className="text-slate-400 hover:text-red-600 p-2 rounded-xl hover:bg-white transition-all"
-                            >
-                               <TrashIcon className="w-5 h-5" />
-                            </button>
-                          </div>
-                        </div>
-                        
-                        <div className="bg-white p-4">
-                          {region.croppedDataUrl ? (
-                             <img src={region.croppedDataUrl} className="w-full h-auto max-h-64 object-contain rounded-xl border border-slate-50" />
-                          ) : (
-                             <div className="w-full h-24 flex items-center justify-center bg-slate-50 rounded-xl animate-pulse text-[10px] font-bold text-slate-300 uppercase tracking-widest">Cleaning...</div>
-                          )}
-                        </div>
-                      </div>
-                    ))}
-                  </div>
+                  <PageCrops
+                    key={page.id}
+                    page={page}
+                    week={weekByPage.get(page.id)}
+                    topic={pageTopic(page.id)}
+                    missing={answerCheck.missingOn.get(page.id)}
+                    answerOf={answerCheck.answerOf}
+                    editingId={editingNumberId && page.regions.some(r => r.id === editingNumberId) ? editingNumberId : null}
+                    actions={cropActions}
+                  />
                 ))}
               </div>
             </div>

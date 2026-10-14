@@ -1,0 +1,23 @@
+# systemd unit for the Q-Crop log server (server/log-server.mjs).
+#
+#   sudo cp deploy/qcrop-logs.service /etc/systemd/system/
+#   sudo mkdir -p /var/lib/qcrop/logs && sudo chown www-data /var/lib/qcrop/logs
+#   sudo systemctl enable --now qcrop-logs
+#
+# Adjust WorkingDirectory to where the project is, and User to the account
+# that may write the log folder. Needs Node 18 or newer; no npm packages.
+
+[Unit]
+Description=Q-Crop edit log server
+After=network.target
+
+[Service]
+WorkingDirectory=/opt/qcrop
+ExecStart=/usr/bin/node server/log-server.mjs
+Environment=QCROP_LOG_DIR=/var/lib/qcrop/logs
+Environment=QCROP_LOG_PORT=3101
+User=www-data
+Restart=always
+
+[Install]
+WantedBy=multi-user.target

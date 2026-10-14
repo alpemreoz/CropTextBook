@@ -95,10 +95,15 @@ computer doesn't sleep in the middle (where the browser supports it).
 
 The web app records what it detected on each page and every correction
 made by hand, so the detection can be improved from real use. Entries go
-to `logs/edits-YYYY-MM-DD.jsonl` in the project folder of the computer
-running the app (`npm run dev` or `npm run preview`), one JSON entry per
-line; nothing leaves that computer. The app says so under the export
-button.
+to `logs/edits-YYYY-MM-DD.jsonl`, one JSON entry per line:
+
+- Run on a computer (`npm start`, `npm run dev`): in the project folder of
+  that computer; nothing leaves it.
+- Served by nginx: on the server, through the log server (see Serving with
+  nginx below).
+
+The app says which under the export button. Only what is listed below is
+logged; the books and the crops themselves never leave the user's computer.
 
 - `page_analyzed`: per page, the boxes the program found (question
   number, box, passage box), the page size, profile, and whether the text
@@ -133,6 +138,38 @@ node scripts/summarize-logs.mjs ./logs-from-user1 ./logs-from-user2 --pages
 It prints how many pages each book needed corrected, corrections by kind,
 which way corrected box edges moved (e.g. bottom edges pulled up: crops
 running into the footer), and with `--pages` every corrected page.
+
+## Serving with nginx
+
+Q-Crop can be served as a website: `npm run build` makes `dist/`, plain
+static files. Every page is analyzed and cropped in the user's browser, so
+the server only hands out files, and the edit log is the one thing users
+send back. `deploy/` has what's needed:
+
+1. Build and copy the app: `npm install && npm run build`, then copy
+   `dist/` to the server (e.g. `/var/www/qcrop/dist`).
+2. nginx: `deploy/nginx.conf` serves `dist/` (with the `.mjs` type pdf.js
+   needs, and long caching for the hashed build files) and passes
+   `/__qcrop/log` to the log server. Set `server_name` and the certificate
+   paths; HTTPS is needed for the screen to stay on during analysis.
+3. Log server: `server/log-server.mjs` (Node 18+, no npm packages) appends
+   the entries to `$QCROP_LOG_DIR/edits-YYYY-MM-DD.jsonl`, listening on
+   127.0.0.1:3101 behind nginx. It takes batches of at most 5 MB and 120
+   requests a minute per address. `deploy/qcrop-logs.service` runs it with
+   systemd:
+
+   ```bash
+   QCROP_LOG_DIR=/var/lib/qcrop/logs node server/log-server.mjs
+   ```
+
+4. Read the logs on the server: `npm run logs -- /var/lib/qcrop/logs`.
+
+The page still loads its styling (Tailwind) and, for scanned books, the OCR
+engine and Turkish language data from public CDNs, so users need internet
+access. Saved work (see above) belongs to the site's address: work saved on
+`localhost:3000` doesn't show on the served site. Served under a sub-path
+(`example.com/qcrop/`), set `base: '/qcrop/'` in `vite.config.ts` before
+building.
 
 ## File names
 
