@@ -1507,7 +1507,7 @@ export default function App() {
 
                 <label
                   className="flex items-center gap-3 mb-4 cursor-pointer select-none"
-                  title="For books whose answer key is listed by week: crops of week pages start with the week, e.g. 6_hafta_aktif_taşıma_q5_s104.jpg. Review sections keep their names."
+                  title="For books whose answer key is listed by week: crops of week pages start with the week, e.g. 6_hafta_aktif_taşıma_s104_q5.jpg. Review sections keep their names."
                 >
                   <input type="checkbox" className="w-4 h-4 accent-brand-600" checked={weekInNames}
                     onChange={e => setWeekInNames(e.target.checked)} />

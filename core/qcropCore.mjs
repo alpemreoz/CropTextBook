@@ -3287,15 +3287,16 @@ export const maskRect = (mask, rect, W, H) => {
 };
 
 /**
- * test04_kütle_merkezi_q1_33.jpg / karbohidratlar_q5_s104.jpg; with `week`
- * (opt-in, for books whose answer keys go by week): 6_hafta_karbohidratlar_q5_s104.jpg
+ * test04_kütle_merkezi_33_q1.jpg / karbohidratlar_s104_q5.jpg: test and
+ * topic, then the page, then the question. With `week` (opt-in, for books
+ * whose answer keys go by week): 6_hafta_karbohidratlar_s104_q5.jpg
  */
 export const cropFileName = ({ week, testNumber, topic, questionNumber, pageLabel }) => {
   const parts = [];
   if (week) parts.push(`${week}_hafta`);
   if (testNumber) parts.push(`test${sanitizeName(testNumber)}`);
   if (topic) parts.push(sanitizeName(topic));
-  parts.push(`q${questionNumber}`);
   if (pageLabel) parts.push(pageLabel);
+  parts.push(`q${questionNumber}`);
   return parts.filter(Boolean).join('_') + '.jpg';
 };

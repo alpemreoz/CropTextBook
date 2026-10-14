@@ -173,7 +173,7 @@ building.
 
 ## File names
 
-`[test<NN>_][<topic>_]q<N>_<page>.jpg`, lowercase, Turkish letters kept.
+`[test<NN>_][<topic>_]<page>_q<N>.jpg`, lowercase, Turkish letters kept.
 
 - **Page**: for PDFs, `s` + the PDF page index (unique across the file, e.g.
   `s104`). For scans, the number in the filename (`..._Page_033.jpg` → `33`),
@@ -185,7 +185,7 @@ building.
 - **Test**: the corner "TEST 04" badge, when the book has one.
 - **Week** (opt-in): for books whose answer key is listed by week, crops of
   week pages can start with the header's "N. HAFTA" badge:
-  `6_hafta_aktif_taşıma_q5_s104.jpg`. Turn it on with **Add week to file
+  `6_hafta_aktif_taşıma_s104_q5.jpg`. Turn it on with **Add week to file
   names** in the web app (remembered in the browser) or `--week` in the CLI.
   Review sections (Tarama, Ara Tatil, Yarıyıl Tatili) keep their names. Pages
   from one cover to the next are one week, so a stray or misread badge is
@@ -194,7 +194,7 @@ building.
   against digit shapes learned from badges it did read. A whole book always
   resolves; with only a few scanned pages loaded, a week can stay blank.
 
-Example: `aktif_taşıma_endositoz_ekzositoz_q5_s104.jpg`.
+Example: `aktif_taşıma_endositoz_ekzositoz_s104_q5.jpg`.
 
 ## CLI (headless, faster)
 
@@ -248,6 +248,9 @@ npm run rename -- <crop folder> --book <the book's PDF or page-image folder>
 npm run rename -- apotemi_crops --book ~/Downloads/demo_books/20261003171555338.pdf
 ```
 
+Crops are named page first, then question (`…_s104_q5.jpg`). Folders made by
+earlier versions (`…_q5_s104.jpg`) are read too, and get the current order.
+
 - The contents page is found in the first pages of the book and read from
   the text layer, or with OCR for scans; `--contents-pages 2-4` says where
   it is.
@@ -267,8 +270,8 @@ npm run rename -- apotemi_crops --book ~/Downloads/demo_books/20261003171555338.
 - `--dry-run` shows the new names without renaming. `answers.csv` is
   updated to the new names, and `--undo` puts the previous names back.
 
-One book per crop folder. Example names: `1_bölüm_gerçek_sayılar_test2_q1_s15.jpg`,
-`bölüm_6_çarpanlara_ayırma_denklem_çözme_q3_s146.jpg`.
+One book per crop folder. Example names: `1_bölüm_gerçek_sayılar_test2_s15_q1.jpg`,
+`bölüm_6_çarpanlara_ayırma_denklem_çözme_s146_q3.jpg`.
 
 ## Book profiles
 
@@ -347,11 +350,11 @@ lists only what differs from the defaults):
 ### Grade-8 books (`4d`, `atom`)
 
 Options run A)–D). Crops of a `4d` book are named after their test in the
-table of contents: `<unit>_ünite_<topic>_<test>_q<N>_s<page>.jpg`, e.g.
-`1_ünite_çarpanlar_ve_katlar_doğrula_1_q3_s10.jpg`; tests for several units
+table of contents: `<unit>_ünite_<topic>_<test>_s<page>_q<N>.jpg`, e.g.
+`1_ünite_çarpanlar_ve_katlar_doğrula_1_s10_q3.jpg`; tests for several units
 ("DENE TESTİ - 1 (1. Ünite)") are named on their own:
-`dene_testi_1_q5_s52.jpg`. Atom books have no contents pages; their header
-gives the test number and topic: `test01_metni_görsellerle_yorumlama_q1_s1.jpg`.
+`dene_testi_1_s52_q5.jpg`. Atom books have no contents pages; their header
+gives the test number and topic: `test01_metni_görsellerle_yorumlama_s1_q1.jpg`.
 The English book's units are named the same way (`1_unit_friendship_remember_1_…`).
 
 Page furniture is kept out of crops: the footer ("8. SINIF - Türkçe",
@@ -372,18 +375,18 @@ an image-only figure may need a hand-drawn passage box.
 Options run A)–E) (A)–D) for Yeniyorum). All three are named from their
 table of contents, as `4d` books are:
 
-- `4d-ayt` (Fizik): `1_ünite_vektörler_kuvvet_dengesi_doğrula_1_q3_s10.jpg`,
-  `dene_testi_1_q5_s58.jpg`; checked against the answer key at the back.
+- `4d-ayt` (Fizik): `1_ünite_vektörler_kuvvet_dengesi_doğrula_1_s10_q3.jpg`,
+  `dene_testi_1_s58_q5.jpg`; checked against the answer key at the back.
 - `4d-ayt-biyoloji`: each topic holds two tests and each unit's "ÖSYM Tarzı
   Testler" several, so the header's test is added:
-  `1_ünite_sinir_doku_nöron_yapısı_test_01_q4_s9.jpg`. Each page prints its
+  `1_ünite_sinir_doku_nöron_yapısı_test_01_s9_q4.jpg`. Each page prints its
   own answers along the bottom ("1-C 2-A …"); they are read from the text
   layer for answers.csv and the self-check. The thin rule down the gutter,
   the line above the footer and the answer strip's frame are kept out of
   the crops: a column's last question doesn't run into them.
 - `yeniyorum`: every topic has "Pekiştir" and "Geliştir" pages and every
-  unit "Bitir" tests: `1_ünite_mevsimlerin_oluşumu_pekiştir_04_q2_s13.jpg`,
-  `1_ünite_bitir_test_02_q5_s24.jpg`. The answer key at the back (grids of
+  unit "Bitir" tests: `1_ünite_mevsimlerin_oluşumu_pekiştir_04_s13_q2.jpg`,
+  `1_ünite_bitir_test_02_s24_q5.jpg`. The answer key at the back (grids of
   numbers and letters) is matched to each page by its unit and test.
 
 The contents can list entries without leader dots (a page number far

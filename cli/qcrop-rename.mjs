@@ -89,15 +89,30 @@ if (undo) {
 }
 
 // ---------------------------------------------------------------------------
-// The crops: "<anything>_q<N>_<page>.jpg" (page "s12" for PDFs, "12" for scans)
+// The crops: "<anything>_<page>_q<N>.jpg" (page "s12" for PDFs, "12" for
+// scans), or "<anything>_q<N>_<page>.jpg" as earlier versions named them.
+// Either way they get the current order.
 // ---------------------------------------------------------------------------
 
-const CROP_RE = /^(?:(.*?)_)?q(\d+)_(s?)(\d+)((?:_\d+)?)\.(jpe?g|png)$/i;
-const crops = (await readdir(folder)).map(file => {
-  const m = CROP_RE.exec(file);
-  return m && { file, q: +m[2], s: m[3], page: +m[4], dup: m[5], ext: m[6] };
+const PAGE_FIRST_RE = /^(?:(.*?)_)?(s?)(\d+)_q(\d+)((?:_\d+)?)\.(jpe?g|png)$/i;
+const Q_FIRST_RE = /^(?:(.*?)_)?q(\d+)_(s?)(\d+)((?:_\d+)?)\.(jpe?g|png)$/i;
+// ("x_1_q3_33.jpg" reads both ways: the folder's order comes from the names
+// that read only one way.)
+const files = await readdir(folder);
+const pageFirstVotes = files.filter(f => PAGE_FIRST_RE.test(f) && !Q_FIRST_RE.test(f)).length;
+const qFirstVotes = files.filter(f => Q_FIRST_RE.test(f) && !PAGE_FIRST_RE.test(f)).length;
+const order = qFirstVotes > pageFirstVotes ? [Q_FIRST_RE, PAGE_FIRST_RE] : [PAGE_FIRST_RE, Q_FIRST_RE];
+const crops = files.map(file => {
+  for (const re of order) {
+    const m = re.exec(file);
+    if (!m) continue;
+    return re === PAGE_FIRST_RE
+      ? { file, q: +m[4], s: m[2], page: +m[3], dup: m[5], ext: m[6] }
+      : { file, q: +m[2], s: m[3], page: +m[4], dup: m[5], ext: m[6] };
+  }
+  return null;
 }).filter(Boolean);
-if (!crops.length) { console.error(`No crops (…_q<N>_<page>.jpg) in ${folder}`); process.exit(1); }
+if (!crops.length) { console.error(`No crops (…_<page>_q<N>.jpg) in ${folder}`); process.exit(1); }
 
 // ---------------------------------------------------------------------------
 // The contents: contents.txt in the folder, --contents, or read from the book
@@ -150,14 +165,14 @@ let before = 0;
 for (const c of crops.sort((a, b) => a.page - b.page || a.q - b.q)) {
   const entry = core.contentsEntryAt(aligned.entries, c.page);
   if (!entry) { before++; continue; }
-  const base = `${core.sanitizeName(entry.name)}_q${c.q}_${c.s}${c.page}`;
+  const base = `${core.sanitizeName(entry.name)}_${c.s}${c.page}_q${c.q}`;
   let name = `${base}${c.dup}.${c.ext.toLowerCase()}`;
   for (let k = 2; taken.has(name); k++) name = `${base}_${k}.${c.ext.toLowerCase()}`;
   taken.add(name);
   if (name !== c.file) pairs.push([c.file, name]);
 }
 
-const used = new Set(pairs.map(([, n]) => n.replace(/_q\d+_.*$/, '')));
+const used = new Set(pairs.map(([, n]) => n.replace(/_s?\d+_q\d+(_\d+)?\.\w+$/, '')));
 console.log(`${pairs.length} of ${crops.length} crop(s) get new names from ${used.size} contents entr${used.size === 1 ? 'y' : 'ies'}` +
   `${before ? `; ${before} crop(s) before the first entry keep theirs` : ''}.`);
 for (const [from, to] of pairs.slice(0, 12)) console.log(`  ${from}  ->  ${to}`);
