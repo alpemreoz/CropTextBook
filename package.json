@@ -11,6 +11,7 @@
     "cli": "node cli/qcrop.mjs",
     "logs": "node scripts/summarize-logs.mjs",
     "rename": "node cli/qcrop-rename.mjs",
+    "options": "node cli/qcrop-options.mjs",
     "log-server": "node server/log-server.mjs"
   },
   "dependencies": {

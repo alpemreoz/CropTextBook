@@ -273,6 +273,36 @@ earlier versions (`…_q5_s104.jpg`) are read too, and get the current order.
 One book per crop folder. Example names: `1_bölüm_gerçek_sayılar_test2_s15_q1.jpg`,
 `bölüm_6_çarpanlara_ayırma_denklem_çözme_s146_q3.jpg`.
 
+## Answer option boxes (experimental)
+
+Finds where each answer option sits in finished crops: the whole option
+(letter plus its text, formula, table row or picture), not just "A)". Works on
+the crop images alone, from any book or resolution.
+
+```bash
+npm run options -- <crops or folders...> [-o options.csv] [--overlay <dir>]
+```
+
+`options.csv` has one row per crop: `crop,options,status`. `options` is JSON
+in the crop's own pixels:
+
+```json
+[{"A": {"X1": 9, "X2": 76, "Y1": 754, "Y2": 791}}, {"B": {"X1": 218, "X2": 292, "Y1": 754, "Y2": 791}}, ...]
+```
+
+`status` is `ok`, `inferred C` (C's letter wasn't read; its spot came from the
+other letters' grid), `missing D` (not found, e.g. a crop cut short) or
+`no options found`. Four-option books (A–D) come out `ok` too. `--overlay`
+writes each crop with its boxes drawn on, for checking by eye.
+
+How it works: option letters are read with Tesseract, plus a shape pass
+for letters OCR misses (beside fractions and drawings). The options are the
+last A, B, C… run in reading order. Letters are grouped into rows; each option
+owns the cell from its letter to the next letter on its row, down to the widest
+blank band before the next row. Its box is the ink in that cell. Narrow marks
+at the crop's sides behind a full-height blank gutter (publisher tabs, dotted
+rules) are ignored. Letters should be at least ~10 px tall in the crop.
+
 ## Book profiles
 
 Some books need settings the default analysis doesn't use: scanned question
