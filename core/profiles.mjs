@@ -151,9 +151,19 @@ export const PROFILES = {
     namesPerTest: true,
     passageWithInstruction: true,
   },
+  // Atom's TYT question banks: as `atom`, but a shared passage's crop starts
+  // with the passage itself, not its instruction ("5. - 6. soruları
+  // aşağıdaki parçaya göre cevaplayınız.").
+  'atom-tyt': {
+    label: 'Atom – TYT Soru Bankası',
+    mixedColumns: true,
+    answerMarks: true,
+    titleFromHeader: true,
+    namesPerTest: true,
+  },
   // AYT question banks (A–E options, text-layer PDFs).
   '4d-ayt': {
-    label: '4D Serisi (NEV) – AYT Soru Bankası (Fizik)',
+    label: '4D Serisi (NEV) – AYT / TYT Soru Bankası (Fizik, Türkçe)',
     mixedColumns: true,
     bookIndex: true,
   },

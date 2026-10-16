@@ -427,25 +427,31 @@ export const mixedColumns = (map, layout, words, marks = hiddenAnswerMarks(words
       bottom = grown;
       layout = { ...layout, contentBottom: bottom };
     }
-    // A thin rule across the page just above the footer, below the last line
-    // of text, ends the content: crops don't run down to it. (Thin: blank
-    // rows close above and below it; a row of pictures is no rule. One
-    // unbroken line, standing free: the bottom edges of framed pictures or
-    // tables side by side aren't one, nor is a table's bottom border, its
-    // sides rising from its ends.)
+    // A thin rule across the page (40% of its width or more) just above the
+    // footer, below the last line of text, ends the content: crops don't run
+    // down to it. (Thin: blank rows close above and below it; a row of
+    // pictures is no rule. One unbroken line, standing free: the bottom edges
+    // of framed pictures or tables side by side aren't one, nor is a table's
+    // bottom border, its sides rising from its ends.)
     const freeRule = (yy) => {
       let best = 0, start = 0, run = 0;
       for (let x = 0, row = yy * W; x < W; x++) { if (map.ink[row + x]) { if (++run > best) { best = run; start = x - run + 1; } } else run = 0; }
-      if (best < W * 0.5) return false;
+      if (best < W * 0.4) return false;
+      // (A side is a line going up from the end: inked on nearly every row
+      // just above it. Letters of the line above only touch a few.)
       for (const x0 of [start, start + best - 4]) {
-        for (let y = yy - 8; y <= yy - 2; y++) for (let x = x0; x < x0 + 4; x++) if (map.ink[y * W + x]) return false;
+        let rows = 0;
+        for (let y = yy - 8; y <= yy - 2; y++) {
+          for (let x = x0; x < x0 + 4; x++) if (map.ink[y * W + x]) { rows++; break; }
+        }
+        if (rows >= 6) return false;
       }
       return true;
     };
     if (footerTop !== null) {
       const lastText = Math.max(top, ...rows.filter(r => r.bbox.y1 <= bottom + 2 && r.bbox.y0 >= top).map(r => r.bbox.y1));
       for (let yy = Math.max(Math.ceil(lastText) + 2, Math.round(footerTop - H * 0.03)); yy < bottom; yy++) {
-        if (map.rowInk[yy] < W * 0.5 || map.rowInk[yy - 3] > W * 0.05 || map.rowInk[yy + 3] > W * 0.05 || !freeRule(yy)) continue;
+        if (map.rowInk[yy] < W * 0.4 || map.rowInk[yy - 3] > W * 0.05 || map.rowInk[yy + 3] > W * 0.05 || !freeRule(yy)) continue;
         bottom = yy - 2;
         layout = { ...layout, contentBottom: bottom };
         break;
@@ -3265,10 +3271,13 @@ export const sanitizeName = (str) => str
  * page image. Padding is proportional, so the same box gives the same area
  * at any render resolution.
  */
+/** The margin a crop adds around its box on every side, as a fraction of the page. */
+export const CROP_MARGIN = 0.005;
+
 export const cropRect = (box, W, H) => {
   // (The same margin on the left as on the right: users widened crops that
   // started right at the text. A question number it reaches is masked.)
-  const pX = W * 0.005, pY = H * 0.005, lP = W * 0.005;
+  const pX = W * CROP_MARGIN, pY = H * CROP_MARGIN, lP = W * CROP_MARGIN;
   const sx = Math.round(Math.max(0, (box.xmin / 1000) * W - lP));
   const sy = Math.round(Math.max(0, (box.ymin / 1000) * H - pY));
   const sw = Math.round(Math.min(W - sx, ((box.xmax - box.xmin) / 1000) * W + lP + pX));

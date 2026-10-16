@@ -58,8 +58,9 @@ is processing: browsers pause PDF page rendering in background tabs.
 
 - **Boxes** are drawn with the margin the export adds around them, so the
   outline on the page is exactly what the exported image will show. Drag a
-  box to move it, drag its handles to resize it, and use
-  **Add Box** to draw a missed question. To drop a crop, use its trash icon
+  box to move it, drag its handles to resize it (the outline's edge stays
+  where it is dropped), and use **Add Box** to draw a missed question (the
+  drawn rectangle is the crop's outline). To drop a crop, use its trash icon
   or select its box on the page and press Delete/Backspace (for example a
   question whose shared passage is on the previous page). A new box is numbered from where it
   sits: a box drawn before Q2 becomes Q1 (when 1 is free), not "highest + 1".
@@ -299,7 +300,8 @@ it analyzes the loaded pages again.
 | `apotemi` | Apotemi – TYT Matematik Soru Bankası |
 | `4d` | 4D Serisi (NEV) – 8. Sınıf Soru Bankası (all subjects) |
 | `atom` | Atom – 8. Sınıf Konu Testleri (all subjects) |
-| `4d-ayt` | 4D Serisi (NEV) – AYT Soru Bankası (Fizik) |
+| `atom-tyt` | Atom – TYT Soru Bankası (Türkçe, Matematik): as `atom`, with passages starting below their instruction line |
+| `4d-ayt` | 4D Serisi (NEV) – AYT / TYT Soru Bankası (Fizik, Türkçe) |
 | `4d-ayt-biyoloji` | 4D Serisi (NEV) – AYT Biyoloji Soru Bankası |
 | `yeniyorum` | Yeniyorum – 8. Sınıf Fen Bilimleri Soru Bankası |
 

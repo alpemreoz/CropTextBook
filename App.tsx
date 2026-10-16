@@ -2,7 +2,7 @@ import React, { useState, useEffect, useRef, useCallback, useMemo } from 'react'
 import Uploader from './components/Uploader';
 import { analyzeTestPageLocal } from './services/localAnalyzer';
 import { expandFiles, LoadedPage, PDF_EXPORT_DPI } from './services/fileLoader';
-import { cropFileName, resolveTopics, resolveWeeks, imageSequence, cropRect, maskRect, stackLayout, checkAnswers, testSegments, majority, bookContents, contentsTestName, checkAgainstKey, checkLabelsAgainstKey, carryTestLabels } from './core/qcropCore.mjs';
+import { CROP_MARGIN, cropFileName, resolveTopics, resolveWeeks, imageSequence, cropRect, maskRect, stackLayout, checkAnswers, testSegments, majority, bookContents, contentsTestName, checkAgainstKey, checkLabelsAgainstKey, carryTestLabels } from './core/qcropCore.mjs';
 import { PROFILES, profileOptions } from './core/profiles.mjs';
 import { QuestionRegion, AppStatus, BoundingBox, PageData } from './types';
 import { LoaderIcon, DownloadIcon, ScissorsIcon, TrashIcon, PlusIcon, ChevronLeftIcon, ChevronRightIcon } from './components/Icons';
@@ -27,6 +27,14 @@ type DragState =
 type Tool = 'select' | 'box' | 'passage';
 
 const MIN_BOX = 10; // minimum box size in 0-1000 units
+// The export margin (cropRect) in 0-1000 units. Boxes are drawn with it, so
+// handles and drags work on the drawn outline: an edge lands where it is
+// dropped (it used to jump out by the margin after each resize).
+const MARGIN = CROP_MARGIN * 1000;
+const outlineOf = (b: BoundingBox): BoundingBox => ({
+  xmin: Math.max(0, b.xmin - MARGIN), ymin: Math.max(0, b.ymin - MARGIN),
+  xmax: Math.min(1000, b.xmax + MARGIN), ymax: Math.min(1000, b.ymax + MARGIN),
+});
 // The edit log goes to the project's logs/ folder when Q-Crop runs on this
 // computer (npm start / npm run dev), else to the server it was opened from.
 const LOGS_LOCAL = ['localhost', '127.0.0.1', '[::1]'].includes(window.location.hostname);
@@ -1048,7 +1056,7 @@ export default function App() {
     }
 
     const onHandle = (b: BoundingBox) =>
-      handlePoints(b).find(([, hx, hy]) => Math.abs(nx - hx) <= tolX && Math.abs(ny - hy) <= tolY)?.[0];
+      handlePoints(outlineOf(b)).find(([, hx, hy]) => Math.abs(nx - hx) <= tolX && Math.abs(ny - hy) <= tolY)?.[0];
     if (selectedPassage) {
       const handle = onHandle(selectedPassage);
       if (handle) {
@@ -1098,12 +1106,13 @@ export default function App() {
       const ymin = Math.max(0, Math.min(1000 - h, o.ymin + ny - startNY));
       return { xmin, ymin, xmax: xmin + w, ymax: ymin + h };
     };
+    // (The pointer drags the drawn outline, the box plus the export margin.)
     const resized = (o: BoundingBox, handle: ResizeHandle): BoundingBox => {
       const b = { ...o };
-      if (handle.includes('w')) b.xmin = Math.min(nx, b.xmax - MIN_BOX);
-      if (handle.includes('e')) b.xmax = Math.max(nx, b.xmin + MIN_BOX);
-      if (handle.includes('n')) b.ymin = Math.min(ny, b.ymax - MIN_BOX);
-      if (handle.includes('s')) b.ymax = Math.max(ny, b.ymin + MIN_BOX);
+      if (handle.includes('w')) b.xmin = Math.min(nx + MARGIN, b.xmax - MIN_BOX);
+      if (handle.includes('e')) b.xmax = Math.max(nx - MARGIN, b.xmin + MIN_BOX);
+      if (handle.includes('n')) b.ymin = Math.min(ny + MARGIN, b.ymax - MIN_BOX);
+      if (handle.includes('s')) b.ymax = Math.max(ny - MARGIN, b.ymin + MIN_BOX);
       return b;
     };
 
@@ -1129,10 +1138,11 @@ export default function App() {
       const b = drag.cur;
       redraw();
       setTool('select');
-      if (!b || b.xmax - b.xmin < MIN_BOX || b.ymax - b.ymin < MIN_BOX || !activePage.imageObj) return;
+      if (!b || b.xmax - b.xmin < MIN_BOX + 2 * MARGIN || b.ymax - b.ymin < MIN_BOX + 2 * MARGIN || !activePage.imageObj) return;
+      // (What was drawn is the outline: the box is inside it by the margin.)
       const box: BoundingBox = {
-        xmin: Math.round(b.xmin), ymin: Math.round(b.ymin),
-        xmax: Math.round(b.xmax), ymax: Math.round(b.ymax),
+        xmin: Math.round(b.xmin + MARGIN), ymin: Math.round(b.ymin + MARGIN),
+        xmax: Math.round(b.xmax - MARGIN), ymax: Math.round(b.ymax - MARGIN),
       };
       if (drag.kind === 'passage') {
         // The passage panel opens for it; the first question after it in
