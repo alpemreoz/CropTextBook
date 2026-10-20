@@ -468,9 +468,10 @@ export const mixedColumns = (map, layout, words, marks = hiddenAnswerMarks(words
     return words.filter(o => o.bbox.x0 >= b.x1 - 1 && o.bbox.x0 - b.x1 < h * 1.5 &&
       o.bbox.y0 < b.y1 && o.bbox.y1 > b.y0).sort((p, q) => p.bbox.x0 - q.bbox.x0)[0];
   };
+  // (A figure's smaller point label beside the number, "5.  A", isn't one.)
   const tableEntry = (b) => {
     const next = after(b);
-    if (!next || !/^\p{L}$/u.test(next.text)) return false;
+    if (!next || !/^\p{L}$/u.test(next.text) || next.bbox.y1 - next.bbox.y0 < (b.y1 - b.y0) * 0.85) return false;
     const then = after(next.bbox);
     return !then || /^\d{1,3}\.$/.test(then.text);
   };
@@ -487,7 +488,16 @@ export const mixedColumns = (map, layout, words, marks = hiddenAnswerMarks(words
   // a numbered table can line up more numbers further in.
   const lxs = labels.filter(b => b.x0 < W * 0.4).map(b => b.x0);
   const lm = lxs.length ? Math.min(...lxs) : null;
-  const maxLeft = Math.max(0, ...labels.filter(b => lm !== null && Math.abs(b.x0 - lm) < tol).map(b => numOf.get(b) ?? 0));
+  const leftNums = labels.filter(b => lm !== null && Math.abs(b.x0 - lm) < tol);
+  const maxLeft = Math.max(0, ...leftNums.map(b => numOf.get(b) ?? 0));
+  // Continuing them: higher than the left numbers above it (a full-width
+  // question further down, its number at the left margin, comes after the
+  // right column's), and none of the left's (a numbered list restarts).
+  const continuesLeft = (o) => {
+    const n = numOf.get(o) ?? 0;
+    return n > Math.max(0, ...leftNums.filter(b => b.y0 < o.y0 + H * 0.025).map(b => numOf.get(b) ?? 0)) &&
+      !leftNums.some(b => numOf.get(b) === n);
+  };
   // The right margin: where hidden answer marks sit (books that have them
   // put one at every question's margin), else where numbers line up that
   // continue the left column's (numbered captions, "2. Şekil", and lists
@@ -507,7 +517,7 @@ export const mixedColumns = (map, layout, words, marks = hiddenAnswerMarks(words
       const same = rs.filter(o => Math.abs(o.x0 - b.x0) < tol);
       // (Fewer numbers that don't continue them: a numbered list inside a
       // right-column question restarts at 1.)
-      const cont = same.filter(o => (numOf.get(o) ?? 0) > maxLeft).length;
+      const cont = same.filter(continuesLeft).length;
       const score = [cont, cont - same.length, same.length];
       const k = best ? score.findIndex((v, i) => v !== best.score[i]) : -1;
       if (!best || (k >= 0 && score[k] > best.score[k])) best = { x: b.x0, score };
@@ -686,9 +696,18 @@ export const mixedColumns = (map, layout, words, marks = hiddenAnswerMarks(words
     const rightOwn = groupLines(words.filter(w => inContent(w.bbox) && w.bbox.x0 > half && w.bbox.y0 >= L.y0 - 2 && w.bbox.y0 < rightBelow));
     const rightBlock = !leftBlock && findOptionBlock(rightOwn, L.y0, rightBelow);
     // (A right-column question counts from its number down to the next
-    // full-width band: it may have started beside an earlier left one.)
-    const sideBySide = rightBlock && !right.some(R => R.y0 < rightBlock.top &&
-      (R.y0 > prevLeft || !full.some(r => r.y0 > R.y0 && r.y0 < L.y0))) &&
+    // full-width band: it may have started beside an earlier left one. One
+    // whose options end above this number, no text in the right half after
+    // them (a figure's point labels aside), has its own.)
+    const ownOptions = (R) => {
+      const rightLines = groupLines(words.filter(w => inContent(w.bbox) && w.bbox.x0 > half && w.bbox.y0 >= R.y0 - 2 && w.bbox.y0 < L.y0 - 2));
+      const b = findOptionBlock(rightLines, R.y0, L.y0);
+      return b && !rightLines.some(l => l.bbox.y0 > b.bottom + 2 && l.text.replace(/\s/g, '').length >= 10);
+    };
+    // (Only the last one above them can be theirs.)
+    const owner = rightBlock && right.filter(R => R.y0 < rightBlock.top).pop();
+    const sideBySide = rightBlock && !(owner &&
+      (owner.y0 > prevLeft || !full.some(r => r.y0 > owner.y0 && r.y0 < L.y0)) && !ownOptions(owner)) &&
       !findOptionBlock(leftOwn, L.y0, rightBelow);
     if (!sideBySide && !own.some(l => l.bbox.y0 < rightBelow && (crossing(l) || (!halfOptions && spread(l) && !rightContinues(l)))) &&
       !pictureRow(L, rightBelow) && !(right.length === 0 || !leftBlock ? pictureAcross(L.y0, Math.min(rightBelow, next)) : false)) return;
@@ -936,6 +955,82 @@ const mulMatrix = (m1, m2) => [
   m1[0] * m2[4] + m1[2] * m2[5] + m1[4],
   m1[1] * m2[4] + m1[3] * m2[5] + m1[5],
 ];
+
+/**
+ * pdf.js text from TrueType CID fonts whose ToUnicode map leaves glyphs out
+ * (PDFs re-saved by macOS: "A) 75" reads "$ 75", "üçgen" "ÖÁJen"). pdf.js
+ * passes an unmapped glyph's id through as its character; the ids of ASCII
+ * glyphs in these fonts are the standard Macintosh order, char code - 29. A
+ * character none of the font's mapped glyphs yields is decoded that way.
+ * `mappedChars(fontName)`: the characters a composite font's ToUnicode map
+ * yields, or null for fonts to leave as they are (pdfjsMappedChars). Items
+ * are pdf.js's own (str, transform, fontName); repaired copies are returned.
+ *
+ * The ")" of an option letter is glyph 12, which reads as a form feed and is
+ * dropped as whitespace: bare letters of such a font running A, B, C, ... as
+ * options do get it back: each next one further along the line or on a line
+ * close below, within the run's width ("A 75  B 80  C 95", a list down the
+ * column, or a grid "A  B / C  D / E").
+ */
+export const repairGlyphIds = (items, mappedChars) => {
+  const fonts = new Map();
+  const fontOf = (name) => {
+    if (!fonts.has(name)) fonts.set(name, mappedChars(name));
+    return fonts.get(name);
+  };
+  const out = items.map(it => {
+    const mapped = typeof it.str === 'string' && it.fontName ? fontOf(it.fontName) : null;
+    if (!mapped) return it;
+    const str = [...it.str].map(ch => {
+      const k = ch.charCodeAt(0);
+      // (Spaces stay: pdf.js puts them in for gaps between words too.)
+      return mapped.has(ch) || k < 3 || k > 97 || k === 32 ? ch : String.fromCharCode(k + 29);
+    }).join('');
+    return str === it.str ? it : { ...it, str };
+  });
+  // (Letters that kept theirs, from another font, are part of a run too.)
+  // (The lost ")" can leave a space inside the item: "A 16 + 4".)
+  const bare = out.filter(it => /^[A-E]\)/.test(it.str) ||
+    (/^[A-E](\s|$)/.test(it.str) && fontOf(it.fontName) && !fontOf(it.fontName).has(')')));
+  const x = (it) => it.transform[4], y = (it) => it.transform[5], size = (it) => Math.hypot(it.transform[2], it.transform[3]);
+  const closed = new Set();
+  for (const a of bare.filter(it => it.str[0] === 'A')) {
+    const run = [a];
+    for (let c = 'B'; c <= 'E'; c = String.fromCharCode(c.charCodeAt(0) + 1)) {
+      const last = run[run.length - 1];
+      const next = bare.filter(it => it.str[0] === c && !closed.has(it) && (
+        (Math.abs(y(it) - y(last)) < size(last) * 0.1 && x(it) > x(last) && x(it) - x(last) < size(last) * 32) ||
+        (y(last) - y(it) > size(last) * 0.5 && y(last) - y(it) < size(last) * 4 &&
+          x(it) > Math.min(...run.map(x)) - size(last) * 0.3 && x(it) < Math.max(...run.map(x)) + size(last) * 0.3)))
+        .sort((p, q) => (y(last) - y(p)) - (y(last) - y(q)) || x(p) - x(q))[0];
+      if (!next) break;
+      run.push(next);
+    }
+    if (run.length >= 3) run.forEach(it => closed.add(it));
+  }
+  return closed.size ? out.map(it => (closed.has(it) && it.str[1] !== ')' ? { ...it, str: it.str[0] + ')' + it.str.slice(1) } : it)) : out;
+};
+
+/**
+ * For repairGlyphIds: the characters each composite font's ToUnicode map
+ * yields, read from a pdf.js page's `commonObjs` after the page was rendered
+ * (or its operator list fetched) with `fontExtraProperties: true`. Only for
+ * fonts whose map shows the Macintosh glyph order (its ASCII entries are
+ * glyph id + 29); others are left alone.
+ */
+export const pdfjsMappedChars = (commonObjs) => (name) => {
+  const font = commonObjs.has(name) ? commonObjs.get(name) : null;
+  const map = font?.composite ? (font.toUnicode?._map ?? font.toUnicode) : null;
+  if (!map || typeof map !== 'object') return null;
+  let ascii = 0, macOrder = 0;
+  for (let k = 4; k <= 97; k++) {
+    if (typeof map[k] !== 'string') continue;
+    ascii++;
+    if (map[k] === String.fromCharCode(k + 29)) macOrder++;
+  }
+  if (ascii < 5 || macOrder < ascii * 0.9) return null;
+  return new Set(Object.values(map).filter(v => typeof v === 'string'));
+};
 
 /**
  * pdf.js getTextContent() items -> { str, x0, y0, x1, y1 } with coordinates

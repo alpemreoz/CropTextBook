@@ -1,4 +1,4 @@
-import { normalizePdfTextItems } from '../core/qcropCore.mjs';
+import { normalizePdfTextItems, pdfjsMappedChars, repairGlyphIds } from '../core/qcropCore.mjs';
 
 // Expands user-selected files into pages. Images pass through as data URLs.
 // PDFs become one lazy page each: rendering and text-layer extraction happen
@@ -50,13 +50,14 @@ const expandPdf = async (file: File): Promise<LoadedPage[]> => {
   const workerUrl = (await import('pdfjs-dist/build/pdf.worker.min.mjs?url')).default;
   pdfjs.GlobalWorkerOptions.workerSrc = workerUrl;
 
-  const doc = await pdfjs.getDocument({ data: await file.arrayBuffer() }).promise;
+  // (fontExtraProperties: the fonts' Unicode maps, for repairGlyphIds)
+  const doc = await pdfjs.getDocument({ data: await file.arrayBuffer(), fontExtraProperties: true }).promise;
   const baseName = file.name.replace(/\.pdf$/i, '');
 
   const load = async (i: number) => {
     const page = await doc.getPage(i);
     const unit = page.getViewport({ scale: 1 });
-    const textItems = normalizePdfTextItems((await page.getTextContent()).items, unit);
+    const rawItems = (await page.getTextContent()).items;
 
     const scale = PDF_RENDER_TARGET / Math.max(unit.width, unit.height);
     const viewport = page.getViewport({ scale });
@@ -67,6 +68,9 @@ const expandPdf = async (file: File): Promise<LoadedPage[]> => {
     ctx.fillStyle = '#fff';
     ctx.fillRect(0, 0, canvas.width, canvas.height);
     await page.render({ canvasContext: ctx, viewport }).promise;
+    // (After rendering: the page's fonts, with their Unicode maps, have
+    // reached commonObjs.)
+    const textItems = normalizePdfTextItems(repairGlyphIds(rawItems, pdfjsMappedChars(page.commonObjs)), unit);
     page.cleanup();
     // A blob URL keeps the JPEG out of the JS heap (base64 strings of a
     // whole book add up to hundreds of MB).

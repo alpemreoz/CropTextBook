@@ -303,6 +303,7 @@ it analyzes the loaded pages again.
 | `atom-tyt` | Atom – TYT Soru Bankası (Türkçe, Matematik): as `atom`, with passages starting below their instruction line |
 | `4d-ayt` | 4D Serisi (NEV) – AYT / TYT Soru Bankası (Fizik, Türkçe) |
 | `4d-ayt-biyoloji` | 4D Serisi (NEV) – AYT Biyoloji Soru Bankası |
+| `atom-geometri` | Atom (4D) – TYT-AYT Geometri Soru Bankası: as `4d-ayt`, with `pdfjsText` |
 | `yeniyorum` | Yeniyorum – 8. Sınıf Fen Bilimleri Soru Bankası |
 
 What a profile can switch on (see `core/profiles.mjs`, where each profile
@@ -348,6 +349,10 @@ lists only what differs from the defaults):
   header ("TEST-1"; or a number over one of the profile's words, "01" /
   "Pekiştir") is added to the entry's name, the answer key is matched by it
   within the unit, and the contents' pages are placed by the page footers.
+- `pdfjsText` (CLI): the text layer is read with pdf.js, as the web app
+  does, instead of poppler. For PDFs re-saved by macOS whose fonts map only
+  some glyphs to text ("A) 75" reads "$ 75"): poppler drops the unmapped
+  glyphs, pdf.js keeps them as glyph numbers, which are decoded.
 
 ### Grade-8 books (`4d`, `atom`)
 
@@ -386,6 +391,13 @@ table of contents, as `4d` books are:
   layer for answers.csv and the self-check. The thin rule down the gutter,
   the line above the footer and the answer strip's frame are kept out of
   the crops: a column's last question doesn't run into them.
+- `atom-geometri` (Atom's TYT-AYT Geometri, a 4D series book): named and
+  checked as `4d-ayt`, `1_ünite_üçgende_açılar_doğrula_4_s20_q1.jpg`. Its PDF
+  (re-saved by macOS) has fonts that map only some glyphs to text, so
+  options read "$ 75" for "A) 75"; the text is decoded (see `pdfjsText`).
+  Options set as pictures (letters over drawings) aren't found, and neither
+  are numbers misprinted in the book ("5 .", "2" without a dot, a second
+  "10." in place of "8.").
 - `yeniyorum`: every topic has "Pekiştir" and "Geliştir" pages and every
   unit "Bitir" tests: `1_ünite_mevsimlerin_oluşumu_pekiştir_04_s13_q2.jpg`,
   `1_ünite_bitir_test_02_s24_q5.jpg`. The answer key at the back (grids of

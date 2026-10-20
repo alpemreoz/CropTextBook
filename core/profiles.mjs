@@ -58,6 +58,11 @@ export const DEFAULTS = {
   // ("TEST-1"; or a number over one of these words, "01" / "Pekiştir") is
   // added to the entry's name: false, true, or the words.
   headerTest: false,
+  // CLI: read the text layer with pdf.js, as the web app does, instead of
+  // poppler: for PDFs whose fonts map only some glyphs to text (re-saved by
+  // macOS), which poppler drops and pdf.js leaves to be decoded (see core
+  // repairGlyphIds). The web app always does this.
+  pdfjsText: false,
 };
 
 export const PROFILES = {
@@ -160,6 +165,16 @@ export const PROFILES = {
     answerMarks: true,
     titleFromHeader: true,
     namesPerTest: true,
+  },
+  // Atom's TYT-AYT Geometry question bank, a 4D series book (contents and
+  // answer key as `4d-ayt`) whose text layer reads "$" for "A)" (see
+  // pdfjsText). Figure-first questions; a page's last one is often set full
+  // width with its figure on the left.
+  'atom-geometri': {
+    label: 'Atom (4D) – TYT-AYT Geometri Soru Bankası',
+    mixedColumns: true,
+    bookIndex: true,
+    pdfjsText: true,
   },
   // AYT question banks (A–E options, text-layer PDFs).
   '4d-ayt': {

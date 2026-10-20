@@ -128,6 +128,33 @@ const pdfTextLayer = async (pdfPath) => {
   return pages;
 };
 
+/**
+ * Per-page text items as the web app reads them (pdf.js), for books whose
+ * fonts poppler can't map (profiles with `pdfjsText`; see core
+ * repairGlyphIds). Same shape as pdfTextLayer's.
+ */
+const pdfjsTextLayer = async (pdfPath) => {
+  const pdfjs = await import('pdfjs-dist/legacy/build/pdf.mjs');
+  const { readFile } = await import('fs/promises');
+  const doc = await pdfjs.getDocument({
+    data: new Uint8Array(await readFile(pdfPath)), isEvalSupported: false, fontExtraProperties: true, verbosity: 0,
+  }).promise;
+  const pages = [];
+  for (let i = 1; i <= doc.numPages; i++) {
+    const page = await doc.getPage(i);
+    const unit = page.getViewport({ scale: 1 });
+    const { items } = await page.getTextContent();
+    // (The fonts' Unicode maps reach commonObjs with the operator list.)
+    await page.getOperatorList();
+    const text = core.normalizePdfTextItems(core.repairGlyphIds(items, core.pdfjsMappedChars(page.commonObjs)), unit);
+    text.aspect = unit.height / unit.width;
+    pages.push(text);
+    page.cleanup();
+  }
+  await doc.destroy();
+  return pages;
+};
+
 /** Render the given pages to JPEG in parallel page ranges; returns pageNo -> file. */
 const renderPdf = async (pdfPath, pageNos, dir) => {
   // Contiguous runs, split so every core gets a share.
@@ -158,7 +185,7 @@ for (const file of inputFiles) {
     const t0 = Date.now();
     let text;
     try {
-      text = await pdfTextLayer(file);
+      text = opts.pdfjsText ? await pdfjsTextLayer(file) : await pdfTextLayer(file);
     } catch (err) {
       if (err.code === 'ENOENT') {
         console.error('PDF input needs poppler (pdftotext/pdftoppm). Install it with: brew install poppler');
